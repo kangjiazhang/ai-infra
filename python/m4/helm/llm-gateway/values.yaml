@@ -17,7 +17,7 @@
 #     --from-literal=password=litellm-m4lab
 #
 #   # ② 聚合安装（release 名固定 llm-gateway，DB 服务名由它派生）
-#   cd /root/leon/m4/helm/llm-gateway
+#   cd /root/leon/ai-infra/python/m4/helm/llm-gateway
 #   helm repo add bitnami https://charts.bitnami.com/bitnami && helm repo update
 #   helm dependency update
 #   helm install llm-gateway . -n llm-gateway
