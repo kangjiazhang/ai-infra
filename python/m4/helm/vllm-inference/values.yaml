@@ -105,6 +105,14 @@ persistence:
   existingClaim: ""        # enabled=true 时必填（Day 2 再引入动态创建 PVC）
   mountPath: /models       # 开启后 HF_HOME 自动指向该路径
 
+# ---------------- 本地 HF 缓存（单节点实验用）----------------
+cache:
+  # 直挂节点上的 HF 缓存目录，避免每个 pod 冷启动都从 HF 拉全量权重
+  # （M4 Day 9 实测坑：不挂时 HF_HOME 指向容器临时目录，权重下载卡十几分钟）
+  # 生产环境应改用 persistence PVC；两者都配时 cache.hostPath 生效
+  hostPath: ""             # 例：/root/leon/m2/models（留空 = 不挂载；本机模型统一在此）
+  mountPath: /root/.cache/huggingface   # 挂载后 HF_HOME 自动指向这里
+
 # ---------------- 共享内存 ----------------
 shm:
   # TP>1 时 NCCL 需要较大 /dev/shm，容器默认 64Mi 常不够，表现为进程被杀

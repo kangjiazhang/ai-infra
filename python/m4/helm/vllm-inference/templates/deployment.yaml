@@ -63,6 +63,9 @@ spec:
           {{- if .Values.persistence.enabled }}
           {{- $hfHome = .Values.persistence.mountPath }}
           {{- end }}
+          {{- if .Values.cache.hostPath }}
+          {{- $hfHome = .Values.cache.mountPath }}
+          {{- end }}
           env:
             - name: VLLM_MODEL
               valueFrom:
@@ -151,6 +154,10 @@ spec:
             - name: models
               mountPath: {{ .Values.persistence.mountPath }}
             {{- end }}
+            {{- if .Values.cache.hostPath }}
+            - name: hf-cache
+              mountPath: {{ .Values.cache.mountPath }}
+            {{- end }}
             {{- if .Values.shm.enabled }}
             - name: shm
               mountPath: /dev/shm
@@ -165,6 +172,13 @@ spec:
         - name: models
           persistentVolumeClaim:
             claimName: {{ required "persistence.enabled=true 时必须提供 persistence.existingClaim（动态创建留到 Day 2）" .Values.persistence.existingClaim }}
+        {{- end }}
+        {{- if .Values.cache.hostPath }}
+        # 单节点/实验环境：直挂节点 HF 缓存，免去每次冷拉全量权重（生产走上面的 PVC）
+        - name: hf-cache
+          hostPath:
+            path: {{ .Values.cache.hostPath }}
+            type: DirectoryOrCreate
         {{- end }}
         {{- if .Values.shm.enabled }}
         - name: shm

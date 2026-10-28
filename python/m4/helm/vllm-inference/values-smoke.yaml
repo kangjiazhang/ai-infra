@@ -63,3 +63,8 @@ tolerations:
 env:
   HF_HOME: /root/.cache/huggingface
   VLLM_USE_FLASHINFER_SAMPLER: "0"
+
+# 单节点：直挂节点 HF 缓存，冷启动免下载（见 values.yaml cache 注释）
+# M2 起模型统一放 /root/leon/m2/models（M2 manifest 同款 hostPath）
+cache:
+  hostPath: /root/leon/m2/models
