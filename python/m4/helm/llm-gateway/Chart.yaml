@@ -14,7 +14,10 @@ dependencies:
     condition: postgresql.enabled
   - name: litellm-helm
     repository: oci://ghcr.io/berriai/litellm-helm
-    version: ">=1.89.0"
+    # 【2026-10 勘误2】范围版本（>=1.89.0）会触发 ghcr tags/list，
+    # 匿名 token 常被拒（403 denied）；精确版本跳过列 tags 直拉。
+    # chart 版本与 LiteLLM 发布号一致，须与 values 里 image.tag 对齐
+    version: "1.90.2"
     condition: litellm-helm.enabled
 
 # 版本纪律：helm dependency update 生成 Chart.lock（记录解析后的精确版本）
