@@ -50,6 +50,7 @@ data:
           # 自托管模型不在 LiteLLM 内置成本表，spend 恒 0——自报价（内部核算价）
           input_cost_per_token: 0.0000002
           output_cost_per_token: 0.0000008
+          weight: 9
 
       # 后端 2：vllm-smoke 实例（llm-lab-m2 命名空间）
       - model_name: qwen-1.5b
@@ -59,10 +60,26 @@ data:
           api_key: os.environ/LITELLM_MASTER_KEY
           input_cost_per_token: 0.0000001
           output_cost_per_token: 0.0000004
+          weight: 9
+
+      # ==== 金丝雀演练（TEMP，测完删除本条 + 恢复 routing_strategy）====
+      # 指向副本为 0 的存量 service：请求必失败——用失败率观测切分比例
+      - model_name: qwen-1.5b
+        litellm_params:
+          model: openai/qwen2.5-1.5b
+          api_base: http://vllm-7b-fp16-tp2.llm-lab-m2.svc.cluster.local:8000/v1
+          api_key: os.environ/LITELLM_MASTER_KEY
+          weight: 1
 
     router_settings:
-      # 单副本时无感知；多副本后按"剩余预算/负载"路由而不是简单轮询
-      routing_strategy: usage-based-routing
+      # ==== 金丝雀演练（TEMP）：simple-shuffle 按 weight 加权随机，切分可见 ====
+      # 常态用 usage-based-routing（按剩余负载选），weight 不主导
+      routing_strategy: simple-shuffle
+      # 故障冷却（自动止损）：deployment 连续失败 allowed_fails 次 → 摘除 cooldown_time 秒
+      # 实验给小值（3 次 / 10s）方便观察"失败→冷却恢复→再失败"的锯齿；
+      # 生产建议 5 次 / 60s 以上：金丝雀挂了自动摘除，失败率从 10% 收敛到接近 0
+      allowed_fails: 3
+      cooldown_time: 10
 
     litellm_settings:
       # 客户端传了后端不认识的参数时丢弃而不是报错（跨模型网关兼容性刚需）
@@ -181,9 +198,13 @@ metadata:
   labels:
     app: litellm-gateway
 spec:
+  # NodePort：节点 IP:30400 直达（实验环境；生产应走 Ingress/TLS）
+  # 好处：绑定 Service 不绑 pod，滚动更新/重启不断链，免去 port-forward
+  type: NodePort
   selector:
     app: litellm-gateway
   ports:
     - name: http
       port: 4000
       targetPort: http
+      nodePort: 30400
