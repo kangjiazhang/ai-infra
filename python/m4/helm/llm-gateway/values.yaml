@@ -1,6 +1,10 @@
 # =====================================================================
 # llm-gateway values（M4 Day 9）—— LiteLLM + Postgres 一体化
 #
+# 【2026-10 状态】此 umbrella chart 因 ghcr.io 对服务器 IP 403 暂未启用。
+# 现行混合部署：DB 走 helm/llm-gateway-postgres/，LiteLLM 本体走
+# k8s/litellm/litellm-gateway.yaml（manifest）。ghcr 恢复后可切回本 chart。
+#
 # 【键结构依据】LiteLLM 官方 OCI chart（litellm-helm）的当前结构：
 #   proxy_config.model_list / masterkeySecretName / db.* 等。
 #   安装前务必核对：helm show values oci://ghcr.io/berriai/litellm-helm
