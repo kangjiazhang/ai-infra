@@ -1,0 +1,169 @@
+# =====================================================================
+# LiteLLM 网关 manifest（M4 Day 9）—— 混合部署的 LiteLLM 本体
+#
+# 【为什么是 manifest 而不是 chart】官方 OCI chart 在 ghcr.io，对服务器
+# IP 网络级 403（helm dependency 拉不下来）；LiteLLM 本体只是一个
+# Deployment + Service + ConfigMap，chart 只是薄封装，手写等价。
+# 镜像走官方镜像站 docker.litellm.ai（绕开 ghcr）。
+#
+# 前置（二选一：已建过就跳过）：
+#   kubectl create namespace llm-gateway
+#   kubectl -n llm-gateway create secret generic litellm-masterkey \
+#     --from-literal=masterkey='sk-litellm-master-m4lab'
+#   kubectl -n llm-gateway create secret generic litellm-db \
+#     --from-literal=username=litellm \
+#     --from-literal=password=litellm-m4lab
+#   # Postgres：helm install，见 ../../helm/llm-gateway-postgres/values.yaml
+#
+# 部署：
+#   kubectl apply -f python/m4/k8s/litellm/litellm-gateway.yaml
+#
+# 验证：
+#   kubectl -n llm-gateway port-forward svc/litellm-gateway 4000:4000
+#   curl -s localhost:4000/v1/models -H "Authorization: Bearer sk-litellm-master-m4lab"
+#
+# 镜像兜底：若 docker.litellm.ai 也不可达——
+#   mac: docker pull ghcr.io/berriai/litellm:v1.90.2 && docker save ... | \
+#        ssh root@server "sudo k3s ctr images import -"
+#   然后把下方 image 改回 ghcr.io/berriai/litellm:v1.90.2（tag 已在本地）
+# =====================================================================
+---
+# LiteLLM 配置：与原 values 的 proxy_config 同源（结构即官方 config.yaml）
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: llm-gateway
+  labels:
+    app: litellm-gateway
+data:
+  config.yaml: |
+    model_list:
+      # 后端 1：M4 chart 部署的 7B AWQ（vllm-qa）
+      - model_name: qwen-7b-int4          # 客户端请求用的虚拟模型名
+        litellm_params:
+          # 必须与后端 --served-model-name 完全一致（已核对：qwen2.5-7b-qa）
+          model: openai/qwen2.5-7b-qa
+          api_base: http://vllm-qa.llm-qa.svc.cluster.local:8000/v1
+          # vLLM 无鉴权，但 openai provider 要求 api_key 非空——引用环境变量
+          api_key: os.environ/LITELLM_MASTER_KEY
+
+      # 后端 2：vllm-smoke 实例（llm-lab-m2 命名空间）
+      - model_name: qwen-1.5b
+        litellm_params:
+          model: openai/qwen2.5-1.5b
+          api_base: http://vllm-smoke.llm-lab-m2.svc.cluster.local:8000/v1
+          api_key: os.environ/LITELLM_MASTER_KEY
+
+    router_settings:
+      # 单副本时无感知；多副本后按"剩余预算/负载"路由而不是简单轮询
+      routing_strategy: usage-based-routing
+
+    litellm_settings:
+      # 客户端传了后端不认识的参数时丢弃而不是报错（跨模型网关兼容性刚需）
+      drop_params: true
+      # 网关→后端超时。Day 4 教训：设 60s 会在 512 token 生成中途被掐断
+      request_timeout: 600
+      num_retries: 2
+      # 虚拟 key / 模型配置入库（/key/generate 依赖 DB）
+      store_model_in_db: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm-gateway
+  namespace: llm-gateway
+  labels:
+    app: litellm-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: litellm-gateway
+  template:
+    metadata:
+      labels:
+        app: litellm-gateway
+    spec:
+      containers:
+        - name: litellm
+          # 官方镜像站（ghcr 被服务器 IP 拒时走这里）；tag 与 chart 版本号一致
+          image: docker.litellm.ai/berriai/litellm:v1.90.2
+          imagePullPolicy: IfNotPresent
+          command: ["litellm", "--config", "/etc/litellm/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+          ports:
+            - name: http
+              containerPort: 4000
+          env:
+            # master key：路由验证 + 后端 api_key 引用（os.environ/LITELLM_MASTER_KEY）
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-masterkey
+                  key: masterkey
+            # DATABASE_URL 由 $(VAR) 展开拼出，密码不落 manifest
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-db
+                  key: username
+            - name: DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-db
+                  key: password
+            # $(VAR) 只能引用前面已定义的变量——DB_NAME 必须在 DATABASE_URL 之前
+            - name: DB_NAME
+              value: litellm
+            - name: DATABASE_URL
+              value: postgresql://$(DB_USER):$(DB_PASS)@llm-gateway-postgresql:5432/$(DB_NAME)
+          # LiteLLM 启动时会跑 DB 迁移；DB 未就绪可能 CrashLoop 1-2 次属正常
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+          livenessProbe:
+            # 宽松：误杀网关 = 所有在途流式请求全断
+            httpGet:
+              path: /health/liveliness
+              port: http
+            periodSeconds: 60
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/litellm
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: litellm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm-gateway
+  namespace: llm-gateway
+  labels:
+    app: litellm-gateway
+spec:
+  selector:
+    app: litellm-gateway
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http

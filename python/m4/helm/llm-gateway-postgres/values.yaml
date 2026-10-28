@@ -1,0 +1,39 @@
+# =====================================================================
+# llm-gateway-postgres values（M4 Day 9）—— bitnami/postgresql 独立 release
+#
+# 【背景】LiteLLM 官方 OCI chart（ghcr.io）对服务器 IP 403（网络级拒绝，
+# 2026-10 实测：bitnami/docker.io 通，唯独 ghcr token 端点拒）。
+# 改混合部署：DB 用 bitnami helm（源畅通），LiteLLM 本体走手写 manifest
+# （python/m4/k8s/litellm/）。原 umbrella chart llm-gateway/ 保留备用，
+# ghcr 恢复可达后可切回。
+#
+# 部署（服务器上）：
+#   helm repo add bitnami https://charts.bitnami.com/bitnami   # 已加过可跳过
+#   helm install llm-gateway-postgresql bitnami/postgresql \
+#     -n llm-gateway --create-namespace -f values.yaml
+#
+# 验证：
+#   kubectl -n llm-gateway get pods -w          # 等 1/1
+#   kubectl -n llm-gateway exec statefulset/llm-gateway-postgresql \
+#     -- psql -U litellm -d litellm -c '\l'
+#
+# 服务名（LiteLLM 连接串用）：<release>-postgresql = llm-gateway-postgresql:5432
+# =====================================================================
+
+auth:
+  username: litellm
+  password: litellm-m4lab      # 与 litellm-db Secret 保持一致
+  database: litellm
+
+primary:
+  persistence:
+    storageClass: local-path   # k3s 默认 SC；local-path 绑定单节点
+    size: 8Gi
+  # 网关的 DB 只是记账（虚拟 key / 配额 / spend），不是大流量存储
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
