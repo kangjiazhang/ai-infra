@@ -72,6 +72,8 @@ data:
       num_retries: 2
       # 虚拟 key / 模型配置入库（/key/generate 依赖 DB）
       store_model_in_db: true
+      # 优雅下线：SIGTERM 后拒新请求、排空在途流（配合 pod 的 300s grace + preStop）
+      graceful_shutdown: true
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -81,7 +83,13 @@ metadata:
   labels:
     app: litellm-gateway
 spec:
-  replicas: 1
+  replicas: 2
+  # 零中断滚动：先起新 pod（readiness 过了才进 endpoint），再退旧的
+  # 注意网关无状态（状态全在 Postgres），天然适合水平扩
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: litellm-gateway
@@ -90,6 +98,8 @@ spec:
       labels:
         app: litellm-gateway
     spec:
+      # 优雅下线预算：SIGTERM 后拒新收旧，等在途流式请求排空（配合 graceful_shutdown）
+      terminationGracePeriodSeconds: 300
       containers:
         - name: litellm
           # 官方镜像站（ghcr 被服务器 IP 拒时走这里）；tag 与 chart 版本号一致
@@ -142,6 +152,11 @@ spec:
               port: http
             periodSeconds: 60
             failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # 等 endpoint 摘除传播（秒级），否则摘除前仍在接新请求，永远清不完
+                command: ["/bin/sh", "-c", "sleep 10"]
           resources:
             requests:
               cpu: 250m
