@@ -1,6 +1,10 @@
 # QA 环境：单卡 INT4，探针宽松，用于日常冒烟与 M4 Day 2~5 的实验
 replicaCount: 1
 
+# Service/Deployment 短名：不加则 fullname = vllm-qa-vllm-inference，
+# 网关 api_base（http://vllm-qa.llm-qa.svc...）会指向不存在的服务（Day 9 实测）
+fullnameOverride: vllm-qa
+
 model:
   id: Qwen/Qwen2.5-7B-Instruct-AWQ
   servedName: qwen2.5-7b-qa

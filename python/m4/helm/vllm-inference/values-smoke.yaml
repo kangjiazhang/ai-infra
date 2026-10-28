@@ -4,12 +4,16 @@
 # 同命名空间 llm-lab-m2），网关 model_list 里的 api_base 不用改
 #
 # 部署：
-#   cd /root/leon/m4/helm/vllm-inference
+#   cd /root/leon/ai-infra/python/m4/helm/vllm-inference
 #   helm install vllm-smoke . -n llm-lab-m2 -f values.yaml -f values-smoke.yaml
 #   （若 M2 存量 vllm-smoke 还在跑，先 kubectl -n llm-lab-m2 delete deploy <旧名>，
 #     否则同名资源冲突——helm 管理的资源带 annotation，存量 manifest 没有）
 
 replicaCount: 1
+
+# Service/Deployment 短名：不加则 fullname = vllm-smoke-vllm-inference，
+# 网关 api_base（http://vllm-smoke.llm-lab-m2.svc...）会指向不存在的服务（Day 9 实测）
+fullnameOverride: vllm-smoke
 
 model:
   id: Qwen/Qwen2.5-1.5B-Instruct
