@@ -1,0 +1,25 @@
+apiVersion: v2
+name: llm-gateway
+description: LiteLLM 网关 + Postgres（M4 Day 9）——聚合依赖，一条 helm install
+type: application
+version: 0.1.0
+
+# 【2026-10 勘误】LiteLLM 官方 GitHub Pages repo（litellmai.github.io/litellm）
+# 已不存在——官方现在只通过 OCI 发布 chart。这里直接引用 OCI artifact，
+# 要求 helm >= 3.8。
+dependencies:
+  - name: postgresql
+    repository: https://charts.bitnami.com/bitnami
+    version: ">=16.0.0"
+    condition: postgresql.enabled
+  - name: litellm-helm
+    repository: oci://ghcr.io/berriai/litellm-helm
+    version: ">=1.89.0"
+    condition: litellm-helm.enabled
+
+# 版本纪律：helm dependency update 生成 Chart.lock（记录解析后的精确版本）
+# ——Chart.lock 和 charts/*.tgz 务必 commit，保证部署可复现、ArgoCD 可纳管
+#
+# 若 dependency update 报 chart name 不匹配（OCI artifact 的内部名以官方为准）：
+#   helm show chart oci://ghcr.io/berriai/litellm-helm
+# 看真实 name，与本文件 dependencies.name 对齐后重跑

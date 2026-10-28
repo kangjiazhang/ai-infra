@@ -1,0 +1,65 @@
+# vllm-smoke：1.5B FP16 单卡
+# 用途：① LiteLLM 网关的 qwen-1.5b 后端 ② Day 8 scale-to-zero / Day 10 金丝雀实验对象
+# 迁移说明：替代 M2 手写 manifest 的存量 vllm-smoke——原地替换（同名 release、
+# 同命名空间 llm-lab-m2），网关 model_list 里的 api_base 不用改
+#
+# 部署：
+#   cd /root/leon/m4/helm/vllm-inference
+#   helm install vllm-smoke . -n llm-lab-m2 -f values.yaml -f values-smoke.yaml
+#   （若 M2 存量 vllm-smoke 还在跑，先 kubectl -n llm-lab-m2 delete deploy <旧名>，
+#     否则同名资源冲突——helm 管理的资源带 annotation，存量 manifest 没有）
+
+replicaCount: 1
+
+model:
+  id: Qwen/Qwen2.5-1.5B-Instruct
+  servedName: qwen2.5-1.5b      # 必须与网关 model_list 的 model: openai/qwen2.5-1.5b 一致
+  dtype: half
+  tp: 1
+  maxModelLen: 4096
+  maxNumSeqs: 16
+  maxNumBatchedTokens: 2048
+  gpuMemoryUtilization: 0.80    # 1.5B FP16 权重 ~3GB，16G 卡余量充足
+  prefixCaching: false
+
+probes:
+  startup:
+    periodSeconds: 10
+    failureThreshold: 30       # 1.5B 冷启动快，5 分钟预算足够
+  readiness:
+    enabled: true
+    periodSeconds: 15
+  liveness:
+    periodSeconds: 60
+    failureThreshold: 3
+
+lifecycle:
+  preStopSleepSeconds: 10
+
+# 1.5B 输出短，gracePeriod 可小于 7B 的 180s
+terminationGracePeriodSeconds: 120
+
+strategy:
+  rollingUpdate:
+    maxSurge: 0
+    maxUnavailable: 1
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 6Gi
+  limits:
+    nvidia.com/gpu: 1
+
+nodeSelector:
+  nvidia.com/gpu.product: Tesla-T4
+
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+env:
+  HF_HOME: /root/.cache/huggingface
+  VLLM_USE_FLASHINFER_SAMPLER: "0"

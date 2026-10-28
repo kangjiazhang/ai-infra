@@ -1,0 +1,11 @@
+{
+  "concurrency-1": {
+    "max_concurrency": 1
+  },
+  "concurrency-8": {
+    "max_concurrency": 8
+  },
+  "concurrency-32": {
+    "max_concurrency": 32
+  }
+}

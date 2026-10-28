@@ -1,0 +1,6 @@
+{
+  "fp16-tp2": {
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "tensor_parallel_size": 2
+  }
+}

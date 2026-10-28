@@ -1,0 +1,21 @@
+# 大体积目录（源码副本/虚拟环境——不走 Git）
+.venv/
+vllm/
+
+# 个人隐私材料（严禁推送到远端）
+简历/
+
+# IDE / 系统
+.idea/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 模型权重与缓存（保险起见，防止误提交）
+*.safetensors
+*.bin
+*.gguf
+models--*/

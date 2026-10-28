@@ -1,0 +1,6 @@
+# M2 实验专用命名空间：用完 kubectl delete ns llm-lab-m2 整体清理
+# 不与现有 llm-lab-hami / llm-lab-infer / keda 混用
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-lab-m2

@@ -1,0 +1,8 @@
+{
+  "default-compile-graph": {
+    "enforce_eager": false
+  },
+  "eager": {
+    "enforce_eager": true
+  }
+}

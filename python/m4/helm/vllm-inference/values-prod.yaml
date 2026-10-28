@@ -1,0 +1,69 @@
+# 正式环境 values
+#
+# 注意本集群资源现实：双 T4 上 TP=2 的单副本会占满两张卡，
+# 因此 maxSurge 必然为 0——发版窗口内可用性下降，靠 preStop + gracePeriod
+# 保证"在途长请求不中断"这一底线（M4 Day 5 的结论）。
+# 生产若要求真正零中断，需要预留第三张卡的余量。
+replicaCount: 1
+
+model:
+  id: Qwen/Qwen2.5-7B-Instruct
+  servedName: qwen2.5-7b
+  revision: main
+  dtype: half             # T4 无 BF16
+  tp: 2
+  maxModelLen: 4096
+  maxNumSeqs: 16
+  maxNumBatchedTokens: 2048
+  gpuMemoryUtilization: 0.85
+  prefixCaching: true
+
+probes:
+  startup:
+    periodSeconds: 10
+    failureThreshold: 60
+    timeoutSeconds: 3
+  readiness:
+    enabled: true
+    periodSeconds: 15
+    timeoutSeconds: 10
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 60
+    failureThreshold: 3
+    timeoutSeconds: 5
+
+lifecycle:
+  preStopSleepSeconds: 10
+
+# 生产最长输出可能更长，预算给到 300s
+terminationGracePeriodSeconds: 300
+
+strategy:
+  rollingUpdate:
+    maxSurge: 0
+    maxUnavailable: 1
+
+shm:
+  enabled: true
+  sizeLimit: 8Gi          # TP=2 时 NCCL 通信缓冲需要更大共享内存
+
+resources:
+  requests:
+    cpu: "4"
+    memory: 16Gi
+  limits:
+    nvidia.com/gpu: 2
+
+nodeSelector:
+  nvidia.com/gpu.product: Tesla-T4
+
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+secret:
+  enabled: false
+  existingSecret: ""

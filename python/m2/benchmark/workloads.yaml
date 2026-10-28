@@ -1,0 +1,27 @@
+# M2 标准工作负载定义
+# 所有对照实验必须从这里选负载，不得临时发明；改动需同步更新实验手册
+
+workloads:
+  short-short:        # 观察：调度开销、小请求
+    input_len: 128
+    output_len: 128
+  long-short:         # 观察：TTFT / Prefill
+    input_len: 2048
+    output_len: 128
+  short-long:         # 观察：TPOT / Decode
+    input_len: 128
+    output_len: 512
+  long-long:          # 观察：容量、排队与尾延迟
+    input_len: 2048
+    output_len: 512
+
+# 压测通用参数
+defaults:
+  num_prompts: 300      # p99 需要足够样本
+  warmups: 10
+  repeats: 3            # 每组重复次数，报告中取中位数
+  percentile_metrics: ttft,tpot,itl,e2el
+  metric_percentiles: 50,95,99
+
+# 并发档位（T4 首轮，若 16 未饱和再追加 32）
+concurrency_levels: [1, 2, 4, 8, 16]

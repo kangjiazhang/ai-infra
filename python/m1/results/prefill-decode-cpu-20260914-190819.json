@@ -1,0 +1,102 @@
+{
+  "environment": {
+    "timestamp": "2026-09-14T19:07:14.070348+08:00",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "device": "cpu",
+    "dtype": "float32",
+    "os": "macOS-26.6.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "processor": "arm",
+    "logical_cpu_count": 14,
+    "pytorch_threads": 8,
+    "python_version": "3.12.7",
+    "torch_version": "2.14.0",
+    "transformers_version": "5.17.0"
+  },
+  "results": [
+    {
+      "case": "short",
+      "run": 1,
+      "prompt_characters": 20,
+      "prompt_tokens": 37,
+      "output_tokens": 12,
+      "tokenization_ms": 0.41041598888114095,
+      "prefill_ms": 81.8137499736622,
+      "ttft_ms": 82.30687497416511,
+      "decode_ms": 232.62991505907848,
+      "decode_tpot_ms": 21.14817409627986,
+      "total_ms": 315.257209003903,
+      "first_token_text": "KV",
+      "generated_text": "KV Cache，全称为键值对缓存，是一种"
+    },
+    {
+      "case": "long",
+      "run": 1,
+      "prompt_characters": 1648,
+      "prompt_tokens": 869,
+      "output_tokens": 12,
+      "tokenization_ms": 1.4690419775433838,
+      "prefill_ms": 576.2067910400219,
+      "ttft_ms": 577.7445420389995,
+      "decode_ms": 237.82733193365857,
+      "decode_tpot_ms": 21.620666539423507,
+      "total_ms": 815.8913750085048,
+      "first_token_text": "KV",
+      "generated_text": "KV Cache，也称为Key-Value Cache，是一种在"
+    },
+    {
+      "case": "short",
+      "run": 2,
+      "prompt_characters": 20,
+      "prompt_tokens": 37,
+      "output_tokens": 12,
+      "tokenization_ms": 0.32783299684524536,
+      "prefill_ms": 99.18720804853365,
+      "ttft_ms": 99.61279202252626,
+      "decode_ms": 200.0208778772503,
+      "decode_tpot_ms": 18.183716170659117,
+      "total_ms": 299.8805000097491,
+      "first_token_text": "KV",
+      "generated_text": "KV Cache，全称为键值对缓存，是一种"
+    },
+    {
+      "case": "long",
+      "run": 2,
+      "prompt_characters": 1648,
+      "prompt_tokens": 869,
+      "output_tokens": 12,
+      "tokenization_ms": 1.1299160541966558,
+      "prefill_ms": 586.3550409558229,
+      "ttft_ms": 587.5500409747474,
+      "decode_ms": 251.51587487198412,
+      "decode_tpot_ms": 22.865079533816736,
+      "total_ms": 839.4318330101669,
+      "first_token_text": "KV",
+      "generated_text": "KV Cache，也称为Key-Value Cache，是一种在"
+    }
+  ],
+  "median_summary": [
+    {
+      "case": "short",
+      "prompt_tokens": 37.0,
+      "output_tokens": 12.0,
+      "tokenization_ms": 0.36912449286319315,
+      "prefill_ms": 90.50047901109792,
+      "ttft_ms": 90.95983349834569,
+      "decode_ms": 216.3253964681644,
+      "decode_tpot_ms": 19.66594513346949,
+      "total_ms": 307.568854506826
+    },
+    {
+      "case": "long",
+      "prompt_tokens": 869.0,
+      "output_tokens": 12.0,
+      "tokenization_ms": 1.2994790158700198,
+      "prefill_ms": 581.2809159979224,
+      "ttft_ms": 582.6472915068734,
+      "decode_ms": 244.67160340282135,
+      "decode_tpot_ms": 22.24287303662012,
+      "total_ms": 827.6616040093359
+    }
+  ]
+}

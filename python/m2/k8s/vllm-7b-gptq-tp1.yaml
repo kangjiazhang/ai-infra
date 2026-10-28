@@ -1,0 +1,79 @@
+# 实验 14-B：Qwen2.5-7B GPTQ INT4 单卡（TP=1）
+# ⚠️ T4 是 SM 7.5（Turing），GPTQ 高速 Kernel 对架构有要求：
+#    若启动失败或日志出现回退/警告，如实记录——这本身就是 Day 13 验收点的活体实验
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-7b-gptq-tp1
+  namespace: llm-lab-m2
+  labels:
+    app: vllm-7b-gptq-tp1
+spec:
+  replicas: 0                    # 实验串行执行，默认不启动，跑这组时改 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-7b-gptq-tp1
+  template:
+    metadata:
+      labels:
+        app: vllm-7b-gptq-tp1
+    spec:
+      schedulerName: hami-scheduler
+      runtimeClassName: nvidia
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.28.0
+        args:
+        - --model
+        - Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4
+        - --served-model-name
+        - qwen2.5-7b
+        - --tensor-parallel-size
+        - "1"
+        - --max-model-len
+        - "4096"
+        - --gpu-memory-utilization
+        - "0.85"
+        ports:
+        - containerPort: 8000
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 60
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            nvidia.com/gpucores: 100
+            nvidia.com/gpumem: 14000
+      volumes:
+      - name: hf-cache
+        hostPath:
+          path: /root/leon/m2/models
+          type: DirectoryOrCreate
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-7b-gptq-tp1
+  namespace: llm-lab-m2
+spec:
+  selector:
+    app: vllm-7b-gptq-tp1
+  ports:
+  - port: 8000
+    targetPort: 8000

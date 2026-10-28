@@ -1,0 +1,174 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vllm.fullname" . }}
+  labels:
+    {{- include "vllm.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: {{ .Values.strategy.type }}
+    {{- if eq .Values.strategy.type "RollingUpdate" }}
+    rollingUpdate:
+      # GPU 独占整数资源：无空闲卡时 maxSurge=1 会让新 Pod 永久 Pending（M4 Day 5）
+      maxSurge: {{ .Values.strategy.rollingUpdate.maxSurge }}
+      maxUnavailable: {{ .Values.strategy.rollingUpdate.maxUnavailable }}
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "vllm.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vllm.selectorLabels" . | nindent 8 }}
+      annotations:
+        # values/参数变化时触发滚动更新（ConfigMap 内容变了但 Pod 不会自动重启）
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vllm.serviceAccountName" . }}
+      # 优雅下线预算：最长在途请求 + preStop + 收尾（M4 Day 5）
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: vllm
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # 通过 ConfigMap 的 entrypoint 启动：exec 之后 vllm 才是 PID 1，
+          # SIGTERM 才能直达引擎，preStop + gracePeriod 的优雅下线才成立
+          command: ["/bin/sh", "/opt/vllm/entrypoint.sh"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          {{- $hfHome := .Values.env.HF_HOME }}
+          {{- if .Values.persistence.enabled }}
+          {{- $hfHome = .Values.persistence.mountPath }}
+          {{- end }}
+          env:
+            - name: VLLM_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "vllm.fullname" . }}-config
+                  key: VLLM_MODEL
+            - name: VLLM_ARGS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "vllm.fullname" . }}-config
+                  key: VLLM_ARGS
+            # 权重缓存位置：开启 persistence 后自动指向挂载点
+            - name: HF_HOME
+              value: {{ $hfHome | quote }}
+            {{- range $key, $value := .Values.env }}
+            {{- if and (ne $key "HF_HOME") $value }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.secret.enabled }}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vllm.hfSecretName" . }}
+                  key: HF_TOKEN
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # 三层探针：startup 只管"起来没起来"，readiness 打真实推理，liveness 兜底进程死亡
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            # /health 只证明 APIServer 活着，GPU 卡死时照样 200（M2 Day 2），
+            # 因此这里真实打一条 max_tokens=1 的 completion；代价是每周期消耗一次极小生成
+            exec:
+              command:
+                - python3
+                - -c
+                - |
+                  import json, urllib.request as ur
+                  body = json.dumps({
+                      "model": "{{ .Values.model.servedName }}",
+                      "messages": [{"role": "user", "content": "ping"}],
+                      "max_tokens": 1,
+                      "temperature": 0,
+                  }).encode()
+                  req = ur.Request(
+                      "http://127.0.0.1:{{ .Values.service.port }}/v1/chat/completions",
+                      data=body,
+                      headers={"Content-Type": "application/json"},
+                  )
+                  ur.urlopen(req, timeout=8)
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          livenessProbe:
+            # 故意宽松：误杀 = 冷启动重来 + 在途长请求全断；
+            # GPU 级故障靠告警与节点隔离处理（M3 Day 6），不指望重启治好
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          lifecycle:
+            preStop:
+              exec:
+                # 等 Endpoint 摘除（传播有秒级延迟），否则 shutdown 期间仍进新请求
+                command: ["/bin/sh", "-c", "sleep {{ .Values.lifecycle.preStopSleepSeconds }}"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: vllm-config
+              mountPath: /opt/vllm
+              readOnly: true
+            {{- if .Values.persistence.enabled }}
+            - name: models
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- end }}
+            {{- if .Values.shm.enabled }}
+            - name: shm
+              mountPath: /dev/shm
+            {{- end }}
+      volumes:
+        - name: vllm-config
+          configMap:
+            name: {{ include "vllm.fullname" . }}-config
+            # 需要可执行权限，entrypoint 由 sh 读取执行
+            defaultMode: 0555
+        {{- if .Values.persistence.enabled }}
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ required "persistence.enabled=true 时必须提供 persistence.existingClaim（动态创建留到 Day 2）" .Values.persistence.existingClaim }}
+        {{- end }}
+        {{- if .Values.shm.enabled }}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.shm.sizeLimit }}
+        {{- end }}

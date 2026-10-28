@@ -1,0 +1,99 @@
+# =====================================================================
+# llm-gateway values（M4 Day 9）—— LiteLLM + Postgres 一体化
+#
+# 【键结构依据】LiteLLM 官方 OCI chart（litellm-helm）的当前结构：
+#   proxy_config.model_list / masterkeySecretName / db.* 等。
+#   安装前务必核对：helm show values oci://ghcr.io/berriai/litellm-helm
+#   （官方文档明确：敏感值只走 Secret，不进 values——这是与旧版 chart
+#    最大的结构差异，master.key/db.url 明文写法已废弃）
+#
+# 部署（服务器上，按顺序）：
+#   # ① 先建 Secret（官方模式：master key 与 DB 凭据都不进 Git/values）
+#   kubectl create namespace llm-gateway
+#   kubectl -n llm-gateway create secret generic litellm-masterkey \
+#     --from-literal=masterkey='sk-litellm-master-m4lab'
+#   kubectl -n llm-gateway create secret generic litellm-db \
+#     --from-literal=username=litellm \
+#     --from-literal=password=litellm-m4lab
+#
+#   # ② 聚合安装（release 名固定 llm-gateway，DB 服务名由它派生）
+#   cd /root/leon/m4/helm/llm-gateway
+#   helm repo add bitnami https://charts.bitnami.com/bitnami && helm repo update
+#   helm dependency update
+#   helm install llm-gateway . -n llm-gateway
+#
+# Redis 说明：官方推荐配 Redis（多副本路由/缓存）；单副本实验可先不配，
+# 若 chart 强制校验再加 bitnami/redis 依赖与对应 secret
+# =====================================================================
+
+# ---------------- Postgres（虚拟 key / 配额 / spend 记账的存储）----------------
+postgresql:
+  enabled: true
+  auth:
+    username: litellm
+    password: litellm-m4lab      # 需与 ① 里 litellm-db secret 的 password 一致
+    database: litellm
+  primary:
+    persistence:
+      storageClass: local-path   # k3s 默认 SC；注意 local-path 绑定单节点
+      size: 8Gi
+
+# ---------------- LiteLLM（OCI chart，官方键结构）----------------
+litellm-helm:
+  enabled: true
+  replicaCount: 1
+
+  image:
+    repository: ghcr.io/berriai/litellm
+    tag: "v1.90.2"               # 固定版本，禁 latest
+
+  # master key 走预建 Secret（① 的 litellm-masterkey）
+  masterkeySecretName: litellm-masterkey
+  masterkeySecretKey: masterkey
+
+  db:
+    # 用上面 bitnami 子 chart 部署的 Postgres，不让 litellm chart 自己再起一个
+    useExisting: true
+    deployStandalone: false
+    endpoint: llm-gateway-postgresql:5432    # <release>-postgresql
+    database: litellm
+    secret:
+      name: litellm-db
+      usernameKey: username
+      passwordKey: password
+
+  # 需要额外环境变量（如外部 provider key、LITELLM_SALT_KEY）时：
+  # 先建 secret 再在此引用。注意 SALT_KEY 一旦设置不可更换（加密 DB 凭据用）
+  environmentSecrets: []
+
+  # ---------- 后端路由表（官方结构：proxy_config.model_list）----------
+  proxy_config:
+    model_list:
+      # 后端 1：M4 chart 部署的 7B AWQ（vllm-qa）
+      - model_name: qwen-7b-int4      # 客户端请求用的虚拟模型名（对外稳定，后端可换）
+        litellm_params:
+          # 必须与后端 --served-model-name 完全一致（chart QA values: qwen2.5-7b-qa）
+          # 部署前先 curl 后端 /v1/models 核对——网关 404 的头号原因
+          model: openai/qwen2.5-7b-qa
+          api_base: http://vllm-qa.llm-qa.svc.cluster.local:8000/v1
+          # vLLM 无鉴权，但 openai provider 要求 api_key 非空——引用环境变量避免明文
+          api_key: os.environ/LITELLM_MASTER_KEY
+
+      # 后端 2：vllm-smoke 实例（M2 存量，llm-lab-m2 命名空间）
+      - model_name: qwen-1.5b
+        litellm_params:
+          model: openai/qwen2.5-1.5b
+          api_base: http://vllm-smoke.llm-lab-m2.svc.cluster.local:8000/v1
+          api_key: os.environ/LITELLM_MASTER_KEY
+
+    # 单副本时无感知；多副本后按"剩余预算/负载"路由而不是简单轮询
+    router_settings:
+      routing_strategy: usage-based-routing
+
+    litellm_settings:
+      # 客户端传了后端不认识的参数时丢弃而不是报错（跨模型网关兼容性刚需）
+      drop_params: true
+      # 网关→后端超时。Day 4 教训：若照普通网关习惯设 60s，
+      # 512 token 长请求会在生成中途被掐断（"流式输出突然停止"）
+      request_timeout: 600
+      num_retries: 2

@@ -1,0 +1,10 @@
+{
+  "awq-tp1": {
+    "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
+    "tensor_parallel_size": 1
+  },
+  "gptq-tp1": {
+    "model": "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4",
+    "tensor_parallel_size": 1
+  }
+}

@@ -1,0 +1,13 @@
+apiVersion: v2
+name: vllm-inference
+description: vLLM OpenAI 兼容推理服务（多环境：QA / 预发 / 正式）
+type: application
+# Chart 版本：随模板变更递增
+version: 0.1.0
+# 与 M2 实验固定的 vLLM 版本保持一致，便于性能数据对比
+appVersion: "0.28.0"
+keywords:
+  - vllm
+  - llm
+  - inference
+  - gpu

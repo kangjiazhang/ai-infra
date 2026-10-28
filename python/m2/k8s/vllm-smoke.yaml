@@ -1,0 +1,83 @@
+# 实验 1：Qwen2.5-1.5B 冒烟（单 vGPU，HAMi 整卡模式）
+# ⚠️ VLLM_IMAGE 占位符：换成固定版本 tag，全程不换
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-smoke
+  namespace: llm-lab-m2
+  labels:
+    app: vllm-smoke
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # GPU 实验不需要滚动，改参数直接重建
+  selector:
+    matchLabels:
+      app: vllm-smoke
+  template:
+    metadata:
+      labels:
+        app: vllm-smoke
+    spec:
+      schedulerName: hami-scheduler   # 必须走 HAMi 调度器，否则 device plugin 报 "no binding pod found"
+      runtimeClassName: nvidia
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.28.0   # 固定版本，Day 1 → Day 18 不换
+        args:
+        - --model
+        - Qwen/Qwen2.5-1.5B-Instruct
+        - --served-model-name
+        - qwen2.5-1.5b
+        - --dtype
+        - half
+        - --max-model-len
+        - "4096"
+        - --gpu-memory-utilization
+        - "0.85"
+        - --enable-log-requests
+        - --enable-log-outputs
+        - --enable-per-request-metrics
+        ports:
+        - containerPort: 8000
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 30     # 模型加载慢，给足时间
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          limits:
+            nvidia.com/gpu: 1        # 1 个 vGPU
+            nvidia.com/gpucores: 100 # 算力 100%
+            nvidia.com/gpumem: 15000 # 显存 MiB，≈ 整张 T4
+      volumes:
+      - name: hf-cache
+        hostPath:
+          path: /root/leon/m2/models    # 服务器上的模型缓存目录
+          type: DirectoryOrCreate
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-smoke
+  namespace: llm-lab-m2
+spec:
+  # ClusterIP：集群内（压测 Pod）走 DNS 访问；宿主机访问用 port-forward（默认只绑 127.0.0.1）
+  # kubectl -n llm-lab-m2 port-forward svc/vllm-smoke 8000:8000
+  selector:
+    app: vllm-smoke
+  ports:
+  - port: 8000
+    targetPort: 8000

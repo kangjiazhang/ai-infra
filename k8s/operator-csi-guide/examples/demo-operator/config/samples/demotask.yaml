@@ -1,0 +1,19 @@
+apiVersion: example.com/v1
+kind: DemoTask
+metadata:
+  name: demo-task-sample
+spec:
+  image: busybox:1.36
+  command:
+    - sh
+    - -c
+    - |
+      echo "DemoTask started at $(date)"
+      echo "Working for 10 seconds..."
+      sleep 10
+      echo "DemoTask completed successfully!"
+  completions: 2
+  parallelism: 2
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  paused: false

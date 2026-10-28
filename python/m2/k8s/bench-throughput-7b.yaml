@@ -1,0 +1,60 @@
+# 离线吞吐基准（Day 7 四类测试之"离线吞吐"）
+# ⚠️ 必须独占 GPU：先 kubectl delete -f vllm-7b-fp16-tp2.yaml 停掉在线服务再跑
+# 跑完：kubectl delete -f bench-throughput-7b.yaml，再恢复在线服务
+# 结果打印到 stdout（kubectl logs），同时落 hostPath 归档
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-throughput-7b
+  namespace: llm-lab-m2
+  labels:
+    app: bench-throughput
+spec:
+  restartPolicy: Never
+  schedulerName: hami-scheduler
+  runtimeClassName: nvidia
+  activeDeadlineSeconds: 3600
+  containers:
+  - name: bench
+    image: vllm/vllm-openai:v0.28.0
+    command:
+    - bash
+    - -c
+    - |
+      set -o pipefail
+      vllm bench throughput \
+        --model Qwen/Qwen2.5-7B-Instruct \
+        --tensor-parallel-size 2 \
+        --input-len 1024 \
+        --output-len 128 \
+        --num-prompts 64 \
+        2>&1 | tee /results/throughput-7b-tp2-$(date +%Y%m%d-%H%M%S).log
+    volumeMounts:
+    - name: hf-cache
+      mountPath: /root/.cache/huggingface
+    - name: results
+      mountPath: /results
+    - name: shm
+      mountPath: /dev/shm
+    resources:
+      limits:
+        nvidia.com/gpu: 2        # 与在线服务同口径：2 vGPU × 15000 MiB
+        nvidia.com/gpucores: 100
+        nvidia.com/gpumem: 15000
+    env:
+    - name: VLLM_LOGGING_LEVEL
+      value: INFO
+  volumes:
+  - name: hf-cache
+    hostPath:
+      path: /root/leon/m2/models
+      type: DirectoryOrCreate
+  - name: results
+    hostPath:
+      path: /root/leon/m2/results/bench
+      type: DirectoryOrCreate
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 4Gi      # TP=2 多 worker 共享内存（vLLM 最低要求 160 MiB，留足余量）

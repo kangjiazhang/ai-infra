@@ -1,0 +1,140 @@
+# =====================================================================
+# ArgoCD Applications（M4 Day 6 / Day 11 GitOps 回路）
+#
+# 同一 chart、两个环境、不同 values——Git push 即发布的完整回路：
+#   本地改 values → git push → ArgoCD 自动 sync → 集群变化 → selfHeal 纠漂移
+#
+# 安装：
+#   kubectl apply -f python/m4/argocd/application.yaml
+# 前提：ArgoCD 已部署且能访问 Git 仓库（私有仓库先在 UI/CLI 配 repo secret）
+#
+# 演练（Day 6 任务 2/3）：
+#   # 完整回路：改 values-qa.yaml 的任一参数 → push →
+#   argocd app get llm-qa          # 观察 sync 状态
+#   # 漂移演练：直接改集群里的镜像 tag，看 selfHeal 多久拉回
+#   kubectl -n llm-qa set image deploy/vllm-qa vllm=dummy:1.0
+#   watch kubectl -n llm-qa get pods
+#
+# 注意：
+# 1. repoURL 必改为你自己的仓库地址（占位符形式写在下面）
+# 2. prod 环境故意不建——等 Day 11 SOP 定稿、且确认双卡资源约束下的
+#    发布策略（maxSurge=0 掉容量窗口）可接受后再上
+# 3. LiteLLM 网关当前是手动 helm install（Day 9）——要么手动、要么
+#    纳入 ArgoCD，二选一；同时用两套会互相打架。纳管模板见文末注释
+# =====================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: llm-qa
+  namespace: argocd
+  # 删除 Application 时联动删除其管理的资源（避免孤儿 Deployment）
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/zhangkangjia/ai-infra.git    targetRevision: main
+    path: python/m4/helm/vllm-inference
+    helm:
+      # 顺序覆盖：先基线，再环境
+      valueFiles:
+        - values.yaml
+        - values-qa.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: llm-qa
+  syncPolicy:
+    automated:
+      prune: true        # Git 里删了，集群里也删
+      selfHeal: true     # 集群侧漂移自动拉回（Day 6 任务 3 演练的就是它）
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: llm-staging
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/zhangkangjia/ai-infra.git    targetRevision: main
+    path: python/m4/helm/vllm-inference
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-staging.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: llm-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: llm-smoke
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/zhangkangjia/ai-infra.git    targetRevision: main
+    path: python/m4/helm/vllm-inference
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-smoke.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    # 沿用 M2 的 llm-lab-m2：网关 model_list 的 api_base 不用改
+    namespace: llm-lab-m2
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+# =====================================================================
+# 网关纳管（Day 9 之后想走 GitOps 时取消注释）
+# 用统一的 umbrella chart llm-gateway（LiteLLM + Postgres 一体），
+# 前提：先 helm uninstall 手动安装的 llm-gateway——两套管理二选一
+# 注意：含 dependency 的 chart 走 ArgoCD，必须把 charts/*.tgz 和
+# Chart.lock 一起 commit（否则 ArgoCD 解析不了外部 chart repo 依赖）
+#
+# apiVersion: argoproj.io/v1alpha1
+# kind: Application
+# metadata:
+#   name: llm-gateway
+#   namespace: argocd
+#   finalizers:
+#     - resources-finalizer.argocd.argoproj.io
+# spec:
+#   project: default
+#   source:
+#     repoURL: https://github.com/zhangkangjia/ai-infra.git
+#     targetRevision: main
+#     path: python/m4/helm/llm-gateway
+#   destination:
+#     server: https://kubernetes.default.svc
+#     namespace: llm-gateway
+#   syncPolicy:
+#     automated:
+#       prune: true
+#       selfHeal: true
+#     syncOptions:
+#       - CreateNamespace=true
+# =====================================================================

@@ -1,0 +1,43 @@
+# 预发环境：贴近正式配置，用于发布演练（Day 5 优雅下线、Day 10 金丝雀）
+# 用 1.5B 换取更短冷启动，便于反复演练
+replicaCount: 1
+
+model:
+  id: Qwen/Qwen2.5-1.5B-Instruct
+  servedName: qwen2.5-1.5b
+  dtype: half
+  tp: 1
+  maxModelLen: 4096
+  maxNumSeqs: 16
+  maxNumBatchedTokens: 2048
+  gpuMemoryUtilization: 0.80
+  prefixCaching: true     # 贴近生产：v0.28 默认开启
+
+probes:
+  startup:
+    periodSeconds: 10
+    failureThreshold: 60
+  readiness:
+    enabled: true
+    periodSeconds: 15
+  liveness:
+    periodSeconds: 60
+    failureThreshold: 3
+
+terminationGracePeriodSeconds: 180
+
+strategy:
+  rollingUpdate:
+    # 预发环境有余量时可开到 1，用于演示"零中断"发版
+    maxSurge: 1
+    maxUnavailable: 0
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 6Gi
+  limits:
+    nvidia.com/gpu: 1
+
+nodeSelector:
+  nvidia.com/gpu.product: Tesla-T4

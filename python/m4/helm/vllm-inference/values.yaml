@@ -1,0 +1,137 @@
+# vllm-inference 基线 values
+#
+# 注释中的"M2/M3"指学习计划里对应实验的结论；默认值均以双 T4 + k3s 实测为基准。
+# 多环境通过 values-qa.yaml / values-staging.yaml / values-prod.yaml 覆盖本文件。
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------- 镜像 ----------------
+image:
+  repository: vllm/vllm-openai
+  # 固定版本，禁止 latest：启动参数、默认值、性能特征都与版本强相关（M2 实验纪律）
+  # 官方镜像 tag 带 v 前缀（v0.28.0），与 pip 包版本号 0.28.0 写法不同
+  tag: "v0.28.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+replicaCount: 1
+
+# ---------------- 模型与推理参数 ----------------
+# 这一节不是普通应用的"开关"，而是服务容量定义（M4 Day 1 的四个差异之一）
+model:
+  id: Qwen/Qwen2.5-7B-Instruct-AWQ
+  servedName: qwen2.5-7b
+  revision: main
+  dtype: half                 # T4 无原生 BF16，统一 FP16（M2 §3.2）
+  tp: 1                       # 7B FP16 需 2（M2 Day 11）；INT4 单卡即可，T4 显存受限
+  maxModelLen: 4096           # 按业务 P99 定，不照搬标称 128K（M2 Day 8：单条 128K 请求吃掉 88% KV）
+  maxNumSeqs: 8               # T4 保守值，先找拐点再扩（M2 Day 9）
+  maxNumBatchedTokens: 1024
+  gpuMemoryUtilization: 0.85  # M2 首轮建议：稳定后再试 0.90，不要一上来 0.95+
+  prefixCaching: false        # v0.28 V1 默认开启；实验需统一口径，故默认关闭
+  extraArgs: []               # 额外 CLI，例如 ["--enable-chunked-prefill"]
+
+# ---------------- 探针 ----------------
+probes:
+  startup:
+    # 只探进程存活；预算 = 冷启动实测 × 1.5（M2 实测：权重加载 ~5s + torch.compile ~24s + CUDA Graph 捕获）
+    periodSeconds: 10
+    failureThreshold: 60      # 600s
+    timeoutSeconds: 3
+  readiness:
+    # 打真实推理：/health 只探 APIServer，GPU 卡死时照样 200（M2 Day 2）
+    enabled: true
+    periodSeconds: 15
+    timeoutSeconds: 10        # 内部 python 请求超时固定 8s，留 2s 余量
+    failureThreshold: 3
+  liveness:
+    # 故意宽松：LLM 误杀 = 冷启动重来 + 在途长请求全断（M4 Day 3）
+    periodSeconds: 60
+    failureThreshold: 3
+    timeoutSeconds: 5
+
+lifecycle:
+  # 等 Endpoint 摘除后再让进程 drain，否则 drain 期间仍进新流量，永远清不完（M4 Day 5）
+  preStopSleepSeconds: 10
+
+# 优雅下线预算：preStop 10s + 512×62ms ≈ 32s + 收尾 ~10s ≈ 52s 理论下限，
+# × 安全系数 1.5~2 → 120s；chart 取 180s 再留一档余量，Day 5 实测后向真值收敛
+terminationGracePeriodSeconds: 180
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    # GPU 是独占整数资源：没有空闲卡时 maxSurge=1 会让新 Pod 永久 Pending
+    # 有 GPU 余量 → 1；无余量 → 0 + maxUnavailable=1（M4 Day 5）
+    maxSurge: 0
+    maxUnavailable: 1
+
+# ---------------- 服务暴露 ----------------
+service:
+  type: ClusterIP
+  port: 8000
+  annotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # vLLM 不需要访问 API Server，关闭 token 自动挂载
+  automountServiceAccountToken: false
+
+# ---------------- 环境变量 ----------------
+env:
+  HF_HOME: /root/.cache/huggingface
+  # 关键：不设此项时 vLLM v0.28 会去 import flashinfer 做采样器探测，缺失即启动崩溃
+  # 本机实测现场：ModuleNotFoundError: No module named 'flashinfer'
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  # 可选：显式指定 attention backend（T4 只能 TRITON_ATTN；留空 = 自动选择，日志会打印结果）
+  VLLM_ATTENTION_BACKEND: ""
+
+# 额外环境变量（原样追加到容器 env，格式为标准 K8s env 列表）
+extraEnv: []
+
+# ---------------- Secret（可选）----------------
+secret:
+  enabled: false           # 下载 gated 模型时开启
+  hfToken: ""              # enabled=true 且未提供 existingSecret 时必填
+  existingSecret: ""       # 已有 Secret 优先，键名固定为 HF_TOKEN
+
+# ---------------- 权重持久化（Day 2 实验用）----------------
+persistence:
+  enabled: false
+  existingClaim: ""        # enabled=true 时必填（Day 2 再引入动态创建 PVC）
+  mountPath: /models       # 开启后 HF_HOME 自动指向该路径
+
+# ---------------- 共享内存 ----------------
+shm:
+  # TP>1 时 NCCL 需要较大 /dev/shm，容器默认 64Mi 常不够，表现为进程被杀
+  enabled: true
+  sizeLimit: 2Gi
+
+# ---------------- 资源 ----------------
+resources:
+  requests:
+    cpu: "2"
+    memory: 8Gi
+  limits:
+    # GPU 是整数独占扩展资源，不可超卖（M3 Day 4）
+    nvidia.com/gpu: 1
+
+# ---------------- 调度 ----------------
+nodeSelector:
+  # M3 Day 5：用"硬件事实标签"选节点（GFD 自动打标），不用主机名
+  nvidia.com/gpu.product: Tesla-T4
+
+tolerations:
+  # 与 M3 Day 5 的污点成对出现：只有显式容忍的 GPU 负载才进得来
+  - key: nvidia.com/gpu
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+affinity: {}
+
+podAnnotations: {}

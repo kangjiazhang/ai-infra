@@ -1,0 +1,81 @@
+# 实验 2：Qwen2.5-7B FP16 双卡基线（TP=2）
+# HAMi：2 个 vGPU × 15000 MiB，一张物理卡放不下两份，必然分散到两张 T4
+# ⚠️ VLLM_IMAGE 占位符：换成固定版本 tag
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-7b-fp16-tp2
+  namespace: llm-lab-m2
+  labels:
+    app: vllm-7b-fp16-tp2
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-7b-fp16-tp2
+  template:
+    metadata:
+      labels:
+        app: vllm-7b-fp16-tp2
+    spec:
+      schedulerName: hami-scheduler   # 必须走 HAMi 调度器，否则 device plugin 报 "no binding pod found"
+      runtimeClassName: nvidia
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.28.0
+        args:
+        - --model
+        - Qwen/Qwen2.5-7B-Instruct
+        - --served-model-name
+        - qwen2.5-7b
+        - --dtype
+        - half
+        - --tensor-parallel-size
+        - "2"
+        - --max-model-len
+        - "4096"
+        - --gpu-memory-utilization
+        - "0.85"
+        ports:
+        - containerPort: 8000
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 90
+          periodSeconds: 10
+          failureThreshold: 60     # 7B 双卡加载 + TP 初始化较慢
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          limits:
+            nvidia.com/gpu: 2        # 2 个 vGPU × 15000 MiB，单卡放不下 → 必然分散到两张物理卡
+            nvidia.com/gpucores: 100
+            nvidia.com/gpumem: 15000
+      volumes:
+      - name: hf-cache
+        hostPath:
+          path: /root/leon/m2/models
+          type: DirectoryOrCreate
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi           # TP 多 worker 通信需要更大共享内存
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-7b-fp16-tp2
+  namespace: llm-lab-m2
+spec:
+  selector:
+    app: vllm-7b-fp16-tp2
+  ports:
+  - port: 8000
+    targetPort: 8000

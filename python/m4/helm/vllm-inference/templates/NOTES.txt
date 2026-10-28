@@ -1,0 +1,38 @@
+{{- $svc := include "vllm.fullname" . -}}
+{{- $gpu := index .Values.resources.limits "nvidia.com/gpu" -}}
+{{ $svc }} 部署完成（namespace: {{ .Release.Namespace }}）
+
+模型：{{ .Values.model.id }}
+别名：{{ .Values.model.servedName }}    dtype={{ .Values.model.dtype }}    TP={{ .Values.model.tp }}    GPU={{ $gpu }} 卡
+
+1) 观察启动（STARTUP 阶段可能持续数分钟，属正常）
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
+
+2) 启动分解（权重加载 / torch.compile / CUDA Graph / KV 容量 / Attention 后端）
+   kubectl -n {{ .Release.Namespace }} logs deploy/{{ $svc }} | grep -E \
+     "Model loading took|torch.compile took|GPU KV cache size|Using .*ATTN|Marlin|Xid"
+
+3) 端口转发并冒烟
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $svc }} {{ .Values.service.port }}:{{ .Values.service.port }}
+   curl -s localhost:{{ .Values.service.port }}/v1/models
+   curl -s localhost:{{ .Values.service.port }}/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"{{ .Values.model.servedName }}","messages":[{"role":"user","content":"用一句话解释 KV Cache"}],"max_tokens":64}'
+
+4) 关键指标（M6 会接入 Prometheus 常驻采集）
+   curl -s localhost:{{ .Values.service.port }}/metrics | grep -E \
+     "num_requests_waiting|num_requests_running|gpu_cache_usage_perc|time_to_first_token|time_per_output_token"
+
+5) 探针语义
+   - startupProbe  : /health，预算 {{ mul .Values.probes.startup.periodSeconds .Values.probes.startup.failureThreshold }}s（冷启动要实测校准）
+   - readinessProbe: 真实打一条 max_tokens=1 的 completion（/health 探不到 GPU 故障）
+   - livenessProbe : 宽松，避免误杀导致冷启动重来 + 长请求全断
+
+6) 发版后必须预热
+   探针全绿 ≠ 性能就绪（M2 实测首请求 TTFT 约为稳态 2 倍）：
+   连打 10 条真实请求，再把流量切过来
+
+7) 回滚
+   helm -n {{ .Release.Namespace }} rollback {{ .Release.Name }}
+   注意：若同时变更了权重版本（model.revision / persistence 内容），
+   回滚 chart 不等于回滚权重——必须核对权重版本并做题集比对（M4 Day 10）

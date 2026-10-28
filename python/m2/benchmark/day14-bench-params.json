@@ -1,0 +1,14 @@
+{
+  "short-short": {
+    "input_len": 128,
+    "output_len": 128
+  },
+  "long-short": {
+    "input_len": 2048,
+    "output_len": 128
+  },
+  "short-long": {
+    "input_len": 128,
+    "output_len": 512
+  }
+}

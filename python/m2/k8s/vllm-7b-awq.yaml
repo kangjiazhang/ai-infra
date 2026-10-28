@@ -1,0 +1,79 @@
+# 实验 4：Qwen2.5-7B AWQ INT4 单卡（GPTQ 同理：改 model 与 served-model-name）
+# AWQ/GPTQ = W4A16：权重 INT4、激活 FP16，dtype 仍为 half
+# ⚠️ VLLM_IMAGE 占位符：换成固定版本 tag；模型名以可信发布方实际仓库名为准
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-7b-awq
+  namespace: llm-lab-m2
+  labels:
+    app: vllm-7b-awq
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-7b-awq
+  template:
+    metadata:
+      labels:
+        app: vllm-7b-awq
+    spec:
+      schedulerName: hami-scheduler   # 必须走 HAMi 调度器，否则 device plugin 报 "no binding pod found"
+      runtimeClassName: nvidia
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.28.0
+        args:
+        - --model
+        - Qwen/Qwen2.5-7B-Instruct-AWQ
+        - --served-model-name
+        - qwen2.5-7b-awq
+        - --dtype
+        - half
+        - --max-model-len
+        - "4096"
+        - --gpu-memory-utilization
+        - "0.85"
+        ports:
+        - containerPort: 8000
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 30
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          limits:
+            nvidia.com/gpu: 1        # 与 FP16 实验同口径：单 vGPU 给满
+            nvidia.com/gpucores: 100
+            nvidia.com/gpumem: 15000
+      volumes:
+      - name: hf-cache
+        hostPath:
+          path: /root/leon/m2/models
+          type: DirectoryOrCreate
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-7b-awq
+  namespace: llm-lab-m2
+spec:
+  selector:
+    app: vllm-7b-awq
+  ports:
+  - port: 8000
+    targetPort: 8000

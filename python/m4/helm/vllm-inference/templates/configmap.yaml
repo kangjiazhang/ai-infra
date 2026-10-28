@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vllm.fullname" . }}-config
+  labels:
+    {{- include "vllm.labels" . | nindent 4 }}
+data:
+  # 模型 ID 作为 vllm serve 的位置参数传入（避免 --model 的弃用告警）
+  VLLM_MODEL: {{ .Values.model.id | quote }}
+
+  # 启动参数：与 Chart 内其他位置共用 vllm.serveArgs，避免两处漂移
+  # 注意：参数以空格分隔交给 shell，单个参数内部不要包含空格
+  VLLM_ARGS: {{ include "vllm.serveArgs" . | trim | replace "\n" " " | quote }}
+
+  # 入口脚本：用 exec 让 vllm 成为 PID 1
+  # —— 只有 vllm 是 PID 1，SIGTERM 才会直达引擎，preStop/gracePeriod 的优雅下线才成立
+  # —— 若写成 "sh -c 'vllm serve ...'" 而不 exec，信号打到 shell 上，长请求会被硬掐
+  entrypoint.sh: |
+    #!/bin/sh
+    set -eu
+    set -- $VLLM_ARGS
+    exec vllm serve "$VLLM_MODEL" "$@"

@@ -1,0 +1,49 @@
+# QA 环境：单卡 INT4，探针宽松，用于日常冒烟与 M4 Day 2~5 的实验
+replicaCount: 1
+
+model:
+  id: Qwen/Qwen2.5-7B-Instruct-AWQ
+  servedName: qwen2.5-7b-qa
+  dtype: half
+  tp: 1
+  maxModelLen: 4096
+  maxNumSeqs: 8
+  maxNumBatchedTokens: 1024
+  gpuMemoryUtilization: 0.85
+  prefixCaching: false
+
+probes:
+  startup:
+    # QA 允许更慢：权重未做本地缓存时首次启动可能 8~10 分钟
+    periodSeconds: 10
+    failureThreshold: 90
+  readiness:
+    enabled: true
+    periodSeconds: 20
+  liveness:
+    periodSeconds: 120
+    failureThreshold: 3
+
+lifecycle:
+  preStopSleepSeconds: 10
+
+terminationGracePeriodSeconds: 180
+
+strategy:
+  rollingUpdate:
+    maxSurge: 0
+    maxUnavailable: 1
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 8Gi
+  limits:
+    nvidia.com/gpu: 1
+
+nodeSelector:
+  nvidia.com/gpu.product: Tesla-T4
+
+env:
+  HF_HOME: /root/.cache/huggingface
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
