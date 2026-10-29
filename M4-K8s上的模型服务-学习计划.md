@@ -709,10 +709,12 @@ KEDA ScaledObject：监控指标源（如 Prometheus 查询 waiting）
 ### 最终自测题（脱稿回答，2026-10-28 实测作答；部署与排障细节见 `python/m4/DEPLOY.md`）
 
 **1. LLM 服务的 chart 与普通服务 chart 有哪四个先天差异？**
-> ① 冷启动分钟级（权重+compile+CUDA graph）→ 探针/滚动窗口全要重算；② GPU 整卡独占不可超卖 → maxSurge 决策相反；③ 权重分发是部署一部分（缓存 hostPath/PVC，Day 9 实测不挂=冷拉卡十几分钟）；④ CPU 伸缩指标失效 → 指标体系整体更换。
+> ① 资源维度：GPU 是整数资源不可微调，且容量参数（max-model-len/max-num-seqs/gpu-memory-utilization）写进 values 就是在定义服务容量上限——多环境差异本质是容量规划差异；② 生命周期：冷启动分钟级（权重+compile+CUDA graph），探针预算与滚动策略必须按这个现实设计；③ 存储策略：权重 GB 级，分发方案（镜像内置/PVC/对象存储/initContainer 预热）是架构决策而非默认项；④ 流量语义：SSE 长连接让"连接断 = 请求死"，优雅下线与整流超时是必选项而非可选项。
 
 **2. 四种权重分发方案怎么选？和 HPA 响应速度什么关系？**
-> 网关 weight（后端不动、秒级切流，Day 9 实测首选）/ Service 副本比（无网关、GPU 贵）/ Mesh（会话级、运维重）/ 客户端 SDK（要发版）。切流是控制面（瞬时），HPA 是容量面（分钟级）——先扩后切，否则小流量打进未扩容实例，指标虚高误导金丝雀判定。
+> 四方案：**镜像内置权重**（换模型=构建 GB 级镜像，适合模型固定/边缘离线）、**PVC 共享卷**（挂载即用，单节点 local-path 等价宿主机目录，跨节点需真共享存储）、**对象存储+下载**（首次下载后缓存，云上标准、模型多）、**initContainer 预热**（权重与镜像解耦，可并行于调度）。选型依据：模型迭代频率（快→与镜像解耦）、模型数量、节点拓扑、离线需求。
+> 与 HPA 的关系：**扩容响应 = 调度 + 拉镜像 + 获得权重 + 加载 + 预热**——权重获取环节在无缓存方案下是分钟级（7B INT4 ~5GB），PVC 本地缓存省得了下载省不了加载；缩容到零再唤醒时，权重方案直接决定服务中断时长。即：**权重分发方案决定 HPA 真实响应时间的下限**——Day 2 的核心结论，Day 9 实测佐证（不挂缓存冷拉权重卡十几分钟）。
+> （注意区分：金丝雀的"weight 流量切分"是 Day 10 主题，不是本题的"权重分发"。）
 
 **3. startupProbe / readinessProbe / livenessProbe 各自的预算依据和设计原则？**
 > startup = 冷启动实测 × 1.5，只探"活着没"；readiness = 真实 max_tokens=1 completion，15s 周期；liveness = 故意宽松（60s×3）——误杀 = 冷启动重来 + 在途全断，GPU 故障靠告警/节点隔离不靠重启。
@@ -730,7 +732,8 @@ KEDA ScaledObject：监控指标源（如 Prometheus 查询 waiting）
 > `preStop sleep + P99 在途生成 × 1.5~2 + 余量`；流式 P99 = TTFT + max_tokens × TPOT。本环境取 7B→180s、1.5B→120s。
 
 **8. SSE 流式流量对网关的要求？用户"答到一半停了"怎么分层排查？**
-> 网关不缓冲透传 chunked；request_timeout 覆盖整条流（60s 会把 512 token 掐断中途，Day 4 实测）。排查分层：客户端/代理 idle timeout → 网关超时与日志 → 后端 finish_reason（无=中途断、length=截断、stop=完整）+ max_num_seqs 排队 + KV 耗尽。
+> 网关要求：不缓冲透传 chunked；request_timeout 覆盖**整条流**（60s 会把 512 token 掐断中途，Day 4 实测）。
+> 排查顺序（核心：先二分"服务端完成了没有"）：① 服务端 `/metrics` 的 e2el 分布与 `finish_reason`——token 数齐、无错误 = 断点在服务端之外（最快的二分）；② 网关/Ingress 的 read timeout 与 buffer 配置（5s 复现现场）；③ 客户端自己的 SSE 解析库 idle timeout（常被忽略）；④ 都正常再回服务端看 KV Cache 抢占（ITL 尖峰后客户端主动断开）。
 
 **9. 为什么 CPU 利用率是无效伸缩指标？推荐什么指标组合？**
 > decode 是 GPU bound，排队过载时 CPU 也不高——HPA 无感。推荐：`num_requests_waiting`（扩容触发）+ TTFT P99（体验报警）+ tokens/s 与 `gpu_cache_usage_perc`（水位）。
@@ -754,7 +757,8 @@ KEDA ScaledObject：监控指标源（如 Prometheus 查询 waiting）
 > 回滚单位是 GB 级权重 + 分钟级冷启动，不是秒级镜像切换；回滚时刻 KV/会话上下文全失效；须防"编排 v1 + 权重 v2"撕裂（revision 显式化 + 权重按版本目录隔离）。有网关后回滚退化为切权重指向旧 deployment——切流秒级、预热分钟级。
 
 **16. 金丝雀观察窗口的四类指标？质量抽检为什么不能省？**
-> 错误率（5xx/连接错误）、延迟（TTFT/TPOT P99）、容量（tokens/s、queue）、资源（显存、KV usage、Xid）。质量抽检不能省：指标全绿 ≠ 输出正常——量化模型的重复循环、乱码都发生在低错误率下，必须抽请求对比（固定题集）。Day 9 补充：客户端失败率还会被网关 retry 兜底掩盖，金丝雀健康度要看网关内部视角（/health + 冷却事件）。
+> 四类缺一不可：① **性能**——TTFT/TPOT p95 对比基线；② **稳定性**——错误率、重启、探针翻转、KV Cache 抢占；③ **质量**——固定题集抽检；④ **成本**——tokens/请求、显存占用是否漂移。
+> 质量抽检不能省：新版本（尤其量化/模型升级）可能**性能指标全绿但输出质量回退**——重复循环、乱码、拒答恶化在性能面板上是隐形的，没有质量抽检的金丝雀是盲的。窗口时长至少覆盖一个完整流量周期（含波峰）。Day 9 补充：客户端失败率还会被网关 retry 兜底掩盖，金丝雀健康度要看网关内部视角（/health + 冷却事件）。
 
 **17. 什么时候该引入 KServe 而不是继续用 chart？**
 > 需要标准推理协议（v2）、多框架异构、原生金丝雀、S3/MLflow 仓库自动拉权重、transformer 前后处理编排、scale-to-zero——即开始重复造 KServe 已抽象的胶水时。单一 vLLM 自控运维（学习期）→ chart 更划算。
