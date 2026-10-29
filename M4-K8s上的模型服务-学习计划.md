@@ -706,25 +706,58 @@ KEDA ScaledObject：监控指标源（如 Prometheus 查询 waiting）
 3. 记录从注入到完全恢复的时间线，与 SOP 对照找差距
 4. 复盘：哪一层如果配置错了，故障会扩大而不是自愈（探针、gracePeriod、发布策略三处各举一例——第一周的反面实验数据在这里用）。同时明确职责边界：**ArgoCD 修的是配置漂移，liveness/Deployment 修的是进程死亡，两者不能互相替代**
 
-### 最终自测题（脱稿回答）
+### 最终自测题（脱稿回答，2026-10-28 实测作答；部署与排障细节见 `python/m4/DEPLOY.md`）
 
-- [ ] LLM 服务的 chart 与普通服务 chart 有哪四个先天差异？
-- [ ] 四种权重分发方案怎么选？和 HPA 响应速度什么关系？
-- [ ] startupProbe / readinessProbe / livenessProbe 在 LLM 场景各自的预算依据和设计原则？
-- [ ] readiness 为什么必须打真实推理？/health 会漏什么？
-- [ ] 发版不中断长请求的三段机制（preStop / 引擎 drain / gracePeriod）各管什么？
-- [ ] GPU 集群滚动更新时 maxSurge 的决策依据？
-- [ ] terminationGracePeriodSeconds 按什么公式估算？
-- [ ] SSE 流式流量对网关的要求？用户"答到一半停了"怎么分层排查？
-- [ ] 为什么 CPU 利用率是无效伸缩指标？推荐什么指标组合？
-- [ ] HPA 扩容的真实延迟构成？对容量规划的含义？
-- [ ] 缩容到零的代价链？什么业务能接受？扩缩振荡怎么防？
-- [ ] KEDA 和 HPA 的分工边界？
-- [ ] 模型网关层解决哪些单服务解决不了的问题？
-- [ ] 限流为什么必须在网关层？TPM/RPM 怎么落地？
-- [ ] 模型回滚与普通应用回滚的本质差异？（权重维度）
-- [ ] 金丝雀观察窗口的四类指标？质量抽检为什么不能省？
-- [ ] 什么时候该引入 KServe 而不是继续用 chart？
+**1. LLM 服务的 chart 与普通服务 chart 有哪四个先天差异？**
+> ① 冷启动分钟级（权重+compile+CUDA graph）→ 探针/滚动窗口全要重算；② GPU 整卡独占不可超卖 → maxSurge 决策相反；③ 权重分发是部署一部分（缓存 hostPath/PVC，Day 9 实测不挂=冷拉卡十几分钟）；④ CPU 伸缩指标失效 → 指标体系整体更换。
+
+**2. 四种权重分发方案怎么选？和 HPA 响应速度什么关系？**
+> 网关 weight（后端不动、秒级切流，Day 9 实测首选）/ Service 副本比（无网关、GPU 贵）/ Mesh（会话级、运维重）/ 客户端 SDK（要发版）。切流是控制面（瞬时），HPA 是容量面（分钟级）——先扩后切，否则小流量打进未扩容实例，指标虚高误导金丝雀判定。
+
+**3. startupProbe / readinessProbe / livenessProbe 各自的预算依据和设计原则？**
+> startup = 冷启动实测 × 1.5，只探"活着没"；readiness = 真实 max_tokens=1 completion，15s 周期；liveness = 故意宽松（60s×3）——误杀 = 冷启动重来 + 在途全断，GPU 故障靠告警/节点隔离不靠重启。
+
+**4. readiness 为什么必须打真实推理？/health 会漏什么？**
+> /health 只探 APIServer HTTP 栈——GPU hang、显存泄漏、decode 死锁时进程活着照样 200，但一条 token 都出不来。真实 completion 覆盖"调度→权重→显存→decode"整链路。
+
+**5. 发版不中断长请求的三段机制各管什么？**
+> preStop sleep 等 endpoint 摘除传播（否则 drain 期间还进新请求，永远清不完）；引擎 drain 拒新收旧、在途流生成完再退；gracePeriod 总预算兜底，超时才 KILL。
+
+**6. GPU 集群滚动更新时 maxSurge 的决策依据？**
+> 唯一依据 = 发版时刻集群空闲 GPU 数（GPU 不可超卖）。有余卡 → surge=1 平滑；双卡全占（本环境）→ surge=0 + maxUnavailable=1，接受掉容量窗口。
+
+**7. terminationGracePeriodSeconds 按什么公式估算？**
+> `preStop sleep + P99 在途生成 × 1.5~2 + 余量`；流式 P99 = TTFT + max_tokens × TPOT。本环境取 7B→180s、1.5B→120s。
+
+**8. SSE 流式流量对网关的要求？用户"答到一半停了"怎么分层排查？**
+> 网关不缓冲透传 chunked；request_timeout 覆盖整条流（60s 会把 512 token 掐断中途，Day 4 实测）。排查分层：客户端/代理 idle timeout → 网关超时与日志 → 后端 finish_reason（无=中途断、length=截断、stop=完整）+ max_num_seqs 排队 + KV 耗尽。
+
+**9. 为什么 CPU 利用率是无效伸缩指标？推荐什么指标组合？**
+> decode 是 GPU bound，排队过载时 CPU 也不高——HPA 无感。推荐：`num_requests_waiting`（扩容触发）+ TTFT P99（体验报警）+ tokens/s 与 `gpu_cache_usage_perc`（水位）。
+
+**10. HPA 扩容的真实延迟构成？对容量规划的含义？**
+> 采集（15-30s）+ 评估（15s）+ 冷启动（分钟级）≈ 5-10 分钟。HPA 应对慢增长不应对突发——突发靠静态预留 + 网关限流/排队兜底。
+
+**11. 缩容到零的代价链？什么业务能接受？扩缩振荡怎么防？**
+> 释放 GPU → 唤醒重调度 → 冷启动分钟级 → 预热（首请求 TTFT≈稳态 2 倍）。内部工具/批处理可接受，在线交互不可。防振荡：stabilization 300s+、minReplicas=1、KEDA 冷却期；伸缩第一原则 = 别制造比不伸缩更糟的状态。
+
+**12. KEDA 和 HPA 的分工边界？**
+> KEDA 是 HPA 的事件驱动外壳（拉队列/事件指标 → external metric → 喂 HPA 执行）。KEDA 管边界（0↔1 与指标接入），HPA 管中间（1→N）。包的关系，不是替代。
+
+**13. 模型网关层解决哪些单服务解决不了的问题？**
+> 统一鉴权与 per-key 配额记账、模型名解耦（客户端不感知后端更换/回滚）、跨后端路由与降级链、金丝雀切流（后端不动、秒级调比例）、统一限流、cost 可观测。
+
+**14. 限流为什么必须在网关层？TPM/RPM 怎么落地？**
+> 后端不认识用户/组织/预算维度；必须在排队调度前拦才能保护容量；多副本需集中计数（Day 9 实测：2 副本无 Redis，rpm 各算各的 = 限额翻倍——多副本必须配 Redis）。TPM/RPM 落地：key 维度 limit + 60s 滑动窗口 + 429。
+
+**15. 模型回滚与普通应用回滚的本质差异？（权重维度）**
+> 回滚单位是 GB 级权重 + 分钟级冷启动，不是秒级镜像切换；回滚时刻 KV/会话上下文全失效；须防"编排 v1 + 权重 v2"撕裂（revision 显式化 + 权重按版本目录隔离）。有网关后回滚退化为切权重指向旧 deployment——切流秒级、预热分钟级。
+
+**16. 金丝雀观察窗口的四类指标？质量抽检为什么不能省？**
+> 错误率（5xx/连接错误）、延迟（TTFT/TPOT P99）、容量（tokens/s、queue）、资源（显存、KV usage、Xid）。质量抽检不能省：指标全绿 ≠ 输出正常——量化模型的重复循环、乱码都发生在低错误率下，必须抽请求对比（固定题集）。Day 9 补充：客户端失败率还会被网关 retry 兜底掩盖，金丝雀健康度要看网关内部视角（/health + 冷却事件）。
+
+**17. 什么时候该引入 KServe 而不是继续用 chart？**
+> 需要标准推理协议（v2）、多框架异构、原生金丝雀、S3/MLflow 仓库自动拉权重、transformer 前后处理编排、scale-to-zero——即开始重复造 KServe 已抽象的胶水时。单一 vLLM 自控运维（学习期）→ chart 更划算。
 
 ---
 
