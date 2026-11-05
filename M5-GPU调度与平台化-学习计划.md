@@ -2,7 +2,7 @@
 
 > 学习周期：2 周（每周 6 天，共 12 天）
 > 建议投入：工作日每天约 2 小时，周六 3～4 小时
-> 学习目标：从"一个服务独占一张卡"进阶到"多个服务/多个租户共享一个 GPU 池"——掌握 GPU 共享的三条路线与隔离边界、队列与配额、批调度、推理感知路由，并能画出一张完整的推理平台架构。
+> 学习目标：从"一个服务独占一张卡"进阶到"多个服务/多个租户共享一个 GPU 池"——掌握 GPU 共享的四种路线（HAMi / MPS / MIG / time-slicing，以独占整卡为基线）与隔离边界、队列与配额、批调度、推理感知路由，并能画出一张完整的推理平台架构。
 > 核心产出：《一卡多服务隔离性验证报告》、一张《AI 推理平台架构图》、一个最小"负载/前缀感知路由器"及其对照实验数据。
 > 大纲定位：**平台工程能力，部分可迁移**。K8s 调度概念（队列、优先级、抢占）你已熟，重点补 GPU 特有的部分：显存/算力的软隔离、碎片、推理流量的状态感知。
 
@@ -13,7 +13,7 @@
 进入 M5 前，应能不看资料解释（M2/M3/M4 已建立）：
 
 - `nvidia.com/gpu` 默认是整数独占资源，为什么不能超卖（M3 Day 4）
-- 本机 GPU 由 **HAMi** 管理：节点上报 `nvidia.com/gpu: 20`（2 卡 × 10 vGPU），Pod 必须走 `schedulerName: hami-scheduler`，资源用 `gpucores` / `gpumem` 扩展资源（M2 实验手册）
+- 本机 GPU 由 **HAMi** 管理：节点上报 `nvidia.com/gpu: 20`（2 卡 × 10 vGPU），资源用 `gpucores` / `gpumem` 扩展资源（M2 实验手册）。M2 实测要求 Pod 显式声明 `schedulerName: hami-scheduler`；**但 M4 的 `vllm-inference` chart 没有声明它，却已部署成功（`DEPLOY.md` 还提到"HAMi/DRA 环境"）——这两个事实目前互相矛盾，Day 0 必须查明原因（见前置检查第 1 项），在此之前不要假设"必须声明"或"无需声明"**
 - 单 vGPU 给满（gpumem 15000、gpucores 100）≈ 独占整卡；HAMi 劫持 NVML，容器内 vLLM 看到的是虚拟显存
 - 网关层解决什么：路由、限流、记账、fallback（M4 Day 9）；LiteLLM 目前做的是"按模型名路由"，不感知后端负载
 - 7B AWQ 在 T4 单卡可跑；1.5B FP16 权重约 3 GB、冷启动约 40s（M2/M4 实测）
@@ -51,7 +51,8 @@ M5 的最终目标是：
 - **文档结论与本机验证结论分开标注**，不混写
 - 所有 `kubectl label/taint/apply` 动节点前先记录当前状态；实验后恢复
 - **不修改、不重启** `llm-lab-hami` 命名空间的 HAMi 组件本身（M2 铁律沿用）；调度策略类实验通过 Pod 注解/资源声明完成
-- 破坏性实验（故意 OOM、杀进程）放在专用命名空间 `llm-lab-m5`，且先把 M4 的 `vllm-qa` / `vllm-smoke` / 网关缩容，避免与邻居互相污染
+- M5 的实验放在专用命名空间 `llm-lab-m5`。M4 的 `vllm-qa` / `vllm-smoke` 各占一张 T4，M5 的 Day 2～4、7、8 需要空闲卡：**这些天开始前把 `vllm-qa`、`vllm-smoke` 缩容到 0 副本（LiteLLM 网关与 Postgres 保持运行，对应模型暂时不可用属预期），Day 12 综合演练前恢复 `vllm-qa`；`vllm-smoke` 因卡位被租户实例占用，继续缩容到 M6 结束（见 Day 12 收尾）**；缩容与恢复清单在 Day 0 写好，实验结束后按清单恢复
+- 安装 Kueue / Volcano 等集群级组件会带来 CRD、webhook、调度器等副作用：安装前记录现状，实验结束后按卸载步骤清理（Day 12 前保留 Kueue 以便综合演练，M6 结束前再决定是否卸载）
 - 对照实验沿用 M2 纪律：固定模型/版本/负载，每组至少 3 次，取中位数，一次只改一个变量
 - 版本敏感项（HAMi 注解名、Kueue/Volcano/GAIE 的 CRD 字段）**一律以本机安装版本的官方文档为准**，本文给出的字段名是定位线索而非保证
 
@@ -65,7 +66,9 @@ python/m5/
 │   └── frag-binpack-spread.yaml    # 碎片实验
 ├── queueing/
 │   ├── kueue/                      # ResourceFlavor / ClusterQueue / LocalQueue
-│   └── volcano/                    # PodGroup / Queue 示例
+│   ├── volcano/                    # PodGroup / Queue 示例
+│   └── queueing-selection.md       # Kueue / Volcano / 都不需要 的选型结论（Day 6）
+├── tenants/                        # Day 11 双租户 manifest（namespace / quota / 队列 / key 说明）
 ├── router/
 │   ├── epp_lite.py                 # 最小负载+前缀感知路由器（FastAPI）
 │   ├── load_gen.py                 # 带共享前缀的负载生成器
@@ -105,17 +108,20 @@ python/m5/
 - **能实操**：HAMi 显存/算力切分、隔离性验证、Binpack/Spread、Kueue 队列配额、负载/前缀感知路由
 - **只做文档分析**：MIG（T4 不支持）、NVLink 拓扑亲和（本机是 PHB、无 NVLink）、DRA 实际切分、llm-d/AIBrix 的完整部署（需多节点与 RDMA/PD 分离硬件）
 - **有条件实操**：MPS（需宿主机层面操作，会影响正在被 HAMi 使用的卡，只在维护窗口、其他负载全停时做，见 Day 4）
-- **关键兼容性约束（务必先理解再动手）**：HAMi 要求 Pod 走 `hami-scheduler`，**Volcano 是另一个调度器，同一个 Pod 不能同时由两者调度**。因此：
+- **关键兼容性约束（务必先理解再动手）**：HAMi 的"挑哪张卡、切多少"由 `hami-scheduler` 决策。**Volcano 是另一个调度器，同一个 Pod 不能同时由两者调度**。因此：
   - Kueue 只做准入/配额，不接管调度 → **与 HAMi 兼容，可用真 GPU 做实验**
   - Volcano 的 Gang 实验在本机用 **CPU / 自定义扩展资源** 模拟，不与 HAMi 争抢真 GPU；这条限制本身就是"平台选型时调度器不能随便叠加"的教学点
 
 ### 前置检查（Day 0，半天）
 
-1. 确认 GPU 分配现状：`kubectl -n llm-qa get pod -o yaml | grep -E 'schedulerName|runtimeClassName|gpumem|gpucores'`。M4 chart 目前 `values.yaml` 没有 HAMi 字段，要确认 `vllm-qa` 是怎么拿到 GPU 的（走 HAMi？走默认 device plugin？），结论写进 `notes/hami-internals.md`
+1. **查明 GPU 分配链路的真实形态**（后续所有实验的前提）：
+   - `kubectl -n llm-qa get pod -o yaml | grep -E 'schedulerName|runtimeClassName|gpumem|gpucores'`：看 `vllm-qa` 的 Pod 实际带了什么
+   - 对照事实：M4 chart 的 `values.yaml` 与模板都没有 `schedulerName`、`runtimeClassName`、`gpumem`、`gpucores`，而 M2 手册说不声明 `hami-scheduler` 会触发 `no binding pod found`。可能的解释（逐一排除，不要先入为主）：HAMi 的 MutatingWebhook 已把 `schedulerName` 注入该命名空间的 Pod / 集群已切换到 DRA 路径 / M4 的 Pod 实际走了默认 device plugin。查 `kubectl get mutatingwebhookconfiguration`、Pod 的 HAMi 注解、`kubectl get resourceclaim -A`
+   - 结论写进 `notes/hami-internals.md`，并据此决定 Day 2 中 chart 的 `gpu.share` 块是"显式声明"还是"依赖 webhook 注入"
 2. `kubectl -n llm-lab-hami get pods`，记录 HAMi 版本、device-plugin / scheduler 的镜像 tag；`kubectl describe node` 记录 `nvidia.com/gpu` capacity 及 `gpumem` / `gpucores` 是否出现在 allocatable
 3. 记录现状快照：各命名空间 GPU 占用、两张卡的 `nvidia-smi` 显存水位、节点标签与污点
-4. 预留 `llm-lab-m5` 命名空间，写清楚"实验期间谁被缩容、实验后如何恢复"的清单
-5. 确认 Prometheus 能抓到 vLLM `/metrics`（M4 Day 7 的 ServiceMonitor 若未做，Day 7 前补上）
+4. 预留 `llm-lab-m5` 命名空间，写清楚"实验期间谁被缩容（`vllm-qa`、`vllm-smoke`）、实验后如何恢复"的清单（含各自 Helm release 名、命名空间、副本数、values 文件）
+5. 确认 Prometheus 能抓到 vLLM `/metrics`（M4 Day 7 的 ServiceMonitor 若未做，Day 7 前补上）；记录实际使用的是哪一套 Prometheus（`llm-lab-infer` 还是 M4 Day 0 的 kube-prometheus-stack），M6 Day 0 会沿用此结论
 
 ---
 
@@ -125,41 +131,46 @@ python/m5/
 
 ### 学习内容
 
-**问题的量化**：M1 的显存公式在这里换个角度用——7B AWQ 权重约 5 GB，T4 16 GB 上跑 `max-model-len 4096 / max-num-seqs 8` 时 KV Cache 也只占几 GB；而 80 GB 卡上同样的服务，**常驻浪费 > 90%**。共享的核心动机：用显存预算的"切分"换取单卡密度，从而降低单位 token 成本（M6 的降本手段之一）。
+**问题的量化**：M1 的显存公式在这里换个角度用——7B AWQ 权重约 5 GB，加上 `max-model-len 4096 / max-num-seqs 8` 的 KV Cache 与运行开销，实际需求约 8～10 GB（以 M1 公式与 M2 启动日志实算为准）。它在 T4 16 GB 上占 50%～60%；放到 80 GB 卡上只占约 10%～12%，**约 90% 的显存闲置**（注意：vLLM 默认按 `gpu-memory-utilization` 预留，独占时这部分"闲置"会被引擎预留走但不产生收益）。共享的核心动机：用显存预算的"切分"换取单卡密度，从而降低单位 token 成本（M6 的降本手段之一）。
 
 **HAMi 的组成**（对照本机 `llm-lab-hami` 的 Pod 逆向，先读文档再验证）：
 
 ```text
-MutatingWebhook      ：给请求了 vGPU 资源的 Pod 改写 schedulerName 等
+MutatingWebhook      ：（上游设计）给请求了 vGPU 资源的 Pod 改写 schedulerName；本机是否生效见 Day 0 / 任务 1
 hami-scheduler       ：scheduler extender，负责"挑哪张卡、切多少"，并把决策写进 Pod 注解
 device-plugin        ：向 kubelet 注册 vGPU 资源，把决策翻译成容器环境/挂载
 libvgpu.so（容器内） ：劫持 CUDA/NVML 调用，实现显存上限与算力时间片限制
 ```
 
+先统一两组术语，后文不再混用：
+
+- **软件强制 vs 硬件强制**：HAMi 的全部隔离都由用户态库在软件层强制，MIG 由硬件分区强制。软件强制意味着"协作式信任"——绕过该库（静态链接、直接调 driver API）理论上可绕开
+- **硬上限 vs 软配额**：HAMi 的**显存**是硬上限（超过 `gpumem` 的分配请求被拒绝，行为确定）；**算力** `gpucores` 是软配额（按时间片限制 kernel 提交，多服务争抢时存在抖动，不保证下限）
+
 关键机制：
 
-- **显存隔离是软限制**：库拦截 `cudaMalloc` 等分配，超过 `gpumem` 就返回 OOM；容器内 `nvidia-smi` 看到的是虚拟显存
-- **算力隔离是时间片限制**：`gpucores` 以百分比约束 kernel 提交占比，不是硬件分区；多服务争抢时存在抖动
-- **所有隔离发生在用户态库层**：绕过该库（静态链接、直接 driver API）理论上可绕开，所以它是"协作式信任"隔离——这是与 MIG 的本质区别
+- **显存**：库拦截 `cudaMalloc` 等分配，超过 `gpumem` 就返回 OOM；容器内 `nvidia-smi` 看到的是虚拟显存
+- **算力**：`gpucores` 以百分比约束 kernel 提交占比，不是硬件分区
+- **故障域不隔离**：所有服务共用同一张物理卡与驱动，驱动/硬件级故障（Xid）会同时影响卡上所有服务——这是与 MIG 的本质区别之一
 
 ### 动手任务
 
-1. 读 `llm-lab-hami` 内各 Pod 的作用，画一张"Pod 创建 → webhook → hami-scheduler 选卡 → device-plugin 注入 → 容器内 libvgpu 生效"时序图
+1. 读 `llm-lab-hami` 内各 Pod 的作用，画一张"Pod 创建 → webhook → hami-scheduler 选卡 → device-plugin 注入 → 容器内 libvgpu 生效"时序图；**同时核实 webhook 在本集群是否真的把 `schedulerName` 注入了 Pod**（查 `MutatingWebhookConfiguration` 的 namespace/object 选择器与 failurePolicy），用它解释 M2 的 165 个失败 Pod 与 M4 chart 未声明 `schedulerName` 却能部署这两个现象
 2. `kubectl describe pod`（任一 HAMi Pod）找到 HAMi 写入的注解（如 `hami.io/...` 的绑定/分配信息），解读它记录了什么
 3. 进入一个 HAMi 容器，比较 `nvidia-smi`（虚拟显存）与宿主机 `nvidia-smi`（物理显存）；记录差异
-4. 估算：本机一张 T4 理论上可同时放几个"1.5B 实例"/"7B AWQ 实例"（按实测权重+KV 预算算，不是拍脑袋）
+4. 估算：本机一张 T4 理论上可同时放几个"1.5B 实例"/"7B AWQ 实例"（按实测权重 + KV 预算 + 每进程 CUDA context 开销算，不是拍脑袋）
 5. 产出 `notes/hami-internals.md`
 
 ### 当天验收
 
 - [ ] 能默画 HAMi 的组件分工与 Pod 创建链路
-- [ ] 能解释"为什么不带 `hami-scheduler` 会 `no binding pod found`"（M2 实测的 165 个失败 Pod）
-- [ ] 能说清显存隔离与算力隔离各自"硬/软"在哪里
+- [ ] 能解释"为什么 Pod 没有被 `hami-scheduler` 调度时会 `no binding pod found`"（M2 实测的 165 个失败 Pod），并说清本集群 webhook 的实际行为
+- [ ] 能用"软件强制/硬件强制""硬上限/软配额"两组术语，说清 HAMi 显存与算力隔离各是什么级别
 
 ### 验收参考答案
 
-> 不带 `hami-scheduler`：Pod 由默认调度器分配节点，但 HAMi 的"选哪张卡、分多少"决策是 hami-scheduler 写进 Pod 注解的；device-plugin 在 `Allocate` 时按注解找"绑定记录"，找不到就报 `no binding pod found`，kubelet 准入失败，Deployment 控制器又不断重建 → 重建风暴。**教训：调度决策和设备分配是两段式协议，缺一段就整体失败。**
-> 软硬之分：显存是"分配拦截"（超限即失败，行为确定，可靠度高）；算力是"时间片配额"（隔离度取决于调度粒度，会抖）。因此生产里**显存隔离可作为准入依据，算力隔离只能当软 QoS**。
+> Pod 没被 `hami-scheduler` 调度：Pod 由默认调度器分配节点，但 HAMi 的"选哪张卡、分多少"决策是 hami-scheduler 写进 Pod 注解的；device-plugin 在 `Allocate` 时按注解找"绑定记录"，找不到就报 `no binding pod found`，kubelet 准入失败，Deployment 控制器又不断重建 → 重建风暴。**教训：调度决策和设备分配是两段式协议，缺一段就整体失败。**
+> 软硬之分：HAMi 的隔离全部是软件强制；其中显存是硬上限（分配被拦截，超限即失败，行为确定，可靠度高），算力是软配额（时间片，隔离度取决于调度粒度，会抖）。因此生产里**显存上限可作为准入依据，算力配额只能当软 QoS**。
 
 ---
 
@@ -170,35 +181,39 @@ libvgpu.so（容器内） ：劫持 CUDA/NVML 调用，实现显存上限与算�
 把 M4 的 chart 接上 HAMi，并想清楚 vLLM 与虚拟显存的**两层预算**：
 
 ```text
-HAMi 层：gpumem = 7000 MiB            → 这个容器最多能 malloc 这么多
-vLLM 层：gpu-memory-utilization = 0.8 → vLLM 以"看到的总显存"为基数预留
+HAMi 层：gpumem = 7000 MiB            → 这个容器最多能 malloc 这么多（硬上限）
+vLLM 层：gpu-memory-utilization = u   → vLLM 以"看到的总显存"（= gpumem）为基数预留
 
-实际预留 = 虚拟总显存 × util。必须保证：权重 + 激活 + KV 预留 + CUDA context ≤ gpumem
+vLLM 预留   = gpumem × u        （权重 + 激活峰值 + KV Cache）
+剩余余量     = gpumem × (1 − u)  （必须装得下 CUDA context、碎片等固定开销 F）
+约束：gpumem × (1 − u) ≥ F   →   u ≤ 1 − F / gpumem
+F 以本机实测为准（启动日志 + 宿主机 nvidia-smi 对账得出，不要拍脑袋）
 ```
 
 注意点：
 
-- vLLM 启动时做 profiling，**看到的是虚拟显存**，所以 util 的基数变了，不能沿用独占整卡的数值
-- 同卡多服务时，每个进程还有各自的 CUDA context（几百 MB），预算要留余量
+- vLLM 启动时做 profiling，**看到的是虚拟显存**，所以 u 的基数变了，不能沿用独占整卡的数值
+- 同卡多服务时，每个进程都有各自的 CUDA context（几百 MB），F 不随 gpumem 缩小而缩小
 - M2 的 `gpu_memory_utilization` 结论（首轮 0.85）是独占口径，共享口径需重新标定
+- 上式是定性约束；**最终以"启动成功 + 启动日志里的 KV Cache 容量 + 稳态无 OOM"为准**
 
 ### 动手任务
 
-1. 改 `vllm-inference` chart：增加 `gpu.share` 配置块，渲染出 `schedulerName: hami-scheduler`、`runtimeClassName: nvidia`、`nvidia.com/gpucores`、`nvidia.com/gpumem`；保持默认值渲染结果与 M4 完全一致（`helm template` diff 为证，不回退）
-2. 在 `llm-lab-m5` 部署**两个 1.5B 实例共享同一张物理卡**（各 `gpumem≈7000`，`gpucores` 各 50），确认两个 vGPU 都落在同一张卡（`describe pod` 的 HAMi 分配注解 + 宿主机 `nvidia-smi` 看总显存）
-3. 为共享口径标定 vLLM 参数：分别尝试 `gpu-memory-utilization` 0.7 / 0.85，记录启动成败、KV Cache 块数（日志里 `GPU KV cache size`）、可承载的 `max-model-len`
-4. 冒烟：两个实例各打 M2 `smoke_test.py`，记录 TTFT/TPOT 与独占整卡的基线对比
+1. 改 `vllm-inference` chart：增加 `gpu.share` 配置块，渲染出 `nvidia.com/gpucores`、`nvidia.com/gpumem`，以及 Day 0 查明后确定需要的 `schedulerName` / `runtimeClassName`；**`gpu.share` 默认关闭，关闭时 `helm template` 的渲染结果与 M4 完全一致**（diff 为证，不回退）
+2. 在 `llm-lab-m5` 部署**两个 1.5B 实例共享同一张物理卡**（各 `gpumem≈7000`，`gpucores` 各 50；单卡显存以本机 HAMi 注册值为准，两者之和不得超过它），确认两个 vGPU 都落在同一张卡（`describe pod` 的 HAMi 分配注解 + 宿主机 `nvidia-smi` 看该卡总占用）
+3. 为共享口径标定 vLLM 参数：分别尝试 `gpu-memory-utilization` 0.7 / 0.85，记录启动成败、KV Cache 容量（日志里 `GPU KV cache size`）、可承载的 `max-model-len`，并反推出本机的 F
+4. 冒烟：两个实例各打 M2 `smoke_test.py`，记录 TTFT/TPOT，与独占整卡的基线对比
 5. 记录"单卡容量表"：同一张 T4 上能稳定放几个服务，各自的 KV 预算是多少
 
 ### 当天验收
 
-- [ ] 两个服务稳定共享一张 T4，宿主机显存占用与 gpumem 之和吻合（含 context 开销）
-- [ ] chart 默认渲染无回退（diff 佐证）
+- [ ] 两个服务稳定共享一张 T4；宿主机该卡已用显存 ≤ 两服务 `gpumem` 之和，且能解释它与 `Σ(gpumem × u)` 的差值（CUDA context 等固定开销）
+- [ ] `gpu.share` 关闭时 chart 渲染无回退（diff 佐证）
 - [ ] 能解释为什么共享口径下 `gpu-memory-utilization` 要重新标定
 
 ### 验收参考答案
 
-> `gpu-memory-utilization` 是"占所见总显存的比例"。独占整卡时所见总显存 ≈ 物理显存，0.85 就是 85% 物理显存；共享时所见总显存是 gpumem（虚拟值），0.85 变成 gpumem 的 85%，但 CUDA context、碎片、profile 峰值等固定开销不随比例缩放——**gpumem 越小，固定开销占比越大，util 能设的上限越低**。所以小切片要用更保守的 util，并以"启动后实际 KV block 数"而非公式为准。
+> `gpu-memory-utilization` 是"占所见总显存的比例"。独占整卡时所见总显存 ≈ 物理显存，0.85 就是 85% 物理显存；共享时所见总显存是 gpumem（虚拟值），0.85 变成 gpumem 的 85%，而 CUDA context、碎片等固定开销 F 不随比例缩放——余量 `gpumem × (1 − u)` 必须装得下 F，所以 **gpumem 越小，u 的上限越低**（`u ≤ 1 − F/gpumem`）。因此小切片要用更保守的 u，并以"启动后实际 KV 容量"而非公式为准。
 
 ---
 
@@ -214,26 +229,32 @@ vLLM 层：gpu-memory-utilization = 0.8 → vLLM 以"看到的总显存"为基�
 | **算力隔离** | 邻居打满时我的延迟/吞吐受影响多大 | 邻居持续高压，我方测 TTFT/TPOT 变化 |
 | **故障域** | 邻居崩溃/OOM/被杀时我是否存活 | 杀邻居进程，观察我方请求与 Pod 状态 |
 
-**对照组**：无隔离共享（不设 `gpumem` 上限，两个 vLLM 都按"整卡"视角抢，模拟 time-slicing 类的无隔离）——用它证明隔离的价值，而不是只证明"有隔离能跑"。
+**对照组（无隔离共享）**：用来证明隔离的价值，而不是只证明"有隔离能跑"。**注意它不能靠"不设 `gpumem`"来构造**——HAMi 下不声明 `gpumem` 通常等于按整卡分配，第二个 Pod 会 Pending 或被排到另一张卡，根本形不成共享。候选构造方式，按优先级尝试（以本机 HAMi 版本文档为准）：
+
+1. 在两个容器里关闭 libvgpu 的资源控制（HAMi 若提供环境变量开关）并各自把 vLLM `gpu-memory-utilization` 压低（如 0.4），保证两个实例都能启动
+2. 改 device plugin 配置为 time-slicing——**会改动 `llm-lab-hami` 组件，违反本计划铁律，不做**
+3. 以上都不可行：对照组降级为**文档结论**，在报告中明确标注"无隔离对照组未做本机实测"，并只用"邻居能否占走我的显存"这类推理性论述
+
+无论哪种，报告里必须写明对照组的构造方式与它的局限。
 
 ### 动手任务
 
-1. **显存**：邻居 Pod 用 PyTorch 脚本循环 `torch.empty` 申请超过自己 gpumem 的显存，预期在其自身 OOM；观察我方 vLLM 的显存与请求是否不受影响。再对无隔离对照组重复，记录区别
+1. **显存**：邻居 Pod 用 PyTorch 脚本循环 `torch.empty` 申请超过自己 `gpumem` 的显存，预期在其自身 OOM；观察我方 vLLM 的显存与请求是否不受影响。有对照组时再对对照组重复，记录区别
 2. **算力**：我方固定负载（M2 压测，闭环并发 2、输入 512/输出 128），邻居分别处于：空闲 / 低压 / 满压，各 3 次，记录我方 TTFT p95、TPOT p95、tokens/s
-3. **算力配额生效性**：改 `gpucores`（如 30 / 50 / 80），看邻居满压时我方的性能是否随配额单调变化；记录配额的"抖动"（单次波动幅度）
+3. **算力配额生效性**：邻居固定 `gpucores=50`、满压；**我方 `gpucores` 取 20 / 30 / 50**（同卡两方之和必须 ≤ 100，否则会因资源不足 Pending），看我方性能是否随配额单调变化；记录配额的"抖动"（同一配置 3 次之间的波动幅度）
 4. **故障域**：`kill -9` 邻居的引擎进程/删除邻居 Pod，观察我方请求是否中断、是否出现 CUDA 错误；再触发一次邻居 OOM（显存超限），确认影响范围
 5. 采集 `gpu_probe.py`（M3 产出）的 util/功耗/时钟曲线，对照三种邻居状态——**特别关注 T4 70W 功耗墙下的降频**（M3 Day 3）对共享场景结论的影响，在报告里单独标注
 6. 产出 `report/一卡多服务隔离性验证报告.md`：三维度表 + 数据 + 结论 + 适用边界
 
 ### 当天验收
 
-- [ ] 报告含显存/算力/故障域三维度各至少一组对照数据（隔离 vs 无隔离）
+- [ ] 报告含显存/算力/故障域三维度各至少一组实测数据；无隔离对照组有实测的写明构造方式，没有的明确标注为文档结论
 - [ ] 能给出一句结论："这套方案适合什么、不适合什么"
 - [ ] 能区分"本机实测结论"与"MIG 等文档结论"
 
 ### 验收参考答案
 
-> 预期（以实测为准，不预设）：显存隔离可靠，邻居超配只会让邻居自己失败；算力隔离只是"软 QoS"——邻居满压时我方 TPOT 一定会抬升，`gpucores` 的作用是限制上限而不是保证下限；故障域上，进程级崩溃通常不波及我方，但**驱动/硬件层故障（Xid）是共享卡的共同故障域**，一张卡上的所有服务一起倒——这条是多租户共享时 SLO 设计的底线。
+> 预期（以实测为准，不预设）：显存上限可靠，邻居超配只会让邻居自己失败；算力配额只是软 QoS——邻居满压时我方 TPOT 预计会抬升，`gpucores` 的作用是限制上限而不是保证下限，是否单调、抖动多大看任务 3 的实测；故障域上，进程级崩溃通常不波及我方，但**驱动/硬件层故障（Xid）是共享卡的共同故障域**，一张卡上的所有服务一起倒——这条是多租户共享时 SLO 设计的底线（该条本机不做破坏性验证，属文档结论）。
 > 因此一卡多服务适合：延迟不敏感或同租户内部的服务、测试/开发环境、小模型长尾；不适合：强 SLO 的核心在线服务与互不信任的租户混布（后者需要 MIG 级硬隔离或独占）。
 
 ---
@@ -242,15 +263,15 @@ vLLM 层：gpu-memory-utilization = 0.8 → vLLM 以"看到的总显存"为基�
 
 ### 学习内容
 
-**四种路线的对比**（大纲 5.1，面试高频）：
+**共享路线对比**（大纲 5.1 的三种方案 HAMi / MPS / MIG，加 time-slicing 作对照，以独占整卡为基线；面试高频）：
 
-| 方案 | 隔离层次 | 显存隔离 | 算力隔离 | 性能损耗 | 灵活性 | 本机可验证 |
-|---|---|---|---|---|---|---|
-| 独占整卡 | 设备 | 强 | 强 | 无 | 低 | ✓ |
-| Time-slicing | 无隔离分时 | 无 | 无 | 上下文切换 | 高 | ✓（对照组模拟） |
-| MPS | 进程级共享 CUDA context | 部分（可限制）| 可配比例 | 低 | 中 | 有条件（宿主机） |
-| MIG | 硬件分区（SM+显存+缓存+带宽） | 强 | 强 | 几乎无 | 低（规格固定） | ✗ T4 不支持，文档 |
-| HAMi | 用户态库软隔离 | 较强（拦截） | 软 | 低~中 | 高（任意切分） | ✓ |
+| 方案 | 强制层次 | 显存隔离 | 算力隔离 | 故障域 | 性能损耗 | 灵活性 | 本机可验证 |
+|---|---|---|---|---|---|---|---|
+| 独占整卡（基线） | 设备 | 强 | 强 | 独立 | 无 | 低 | ✓ |
+| Time-slicing | 无隔离分时 | 无 | 无 | 共享（硬件/驱动级） | 上下文切换 | 高 | 有条件（见 Day 3 对照组说明） |
+| MPS | 进程共享同一 CUDA context | 部分（可设上限） | 可配比例 | 共享（一个客户端的致命错误可能波及同一 MPS server 下所有客户端） | 低 | 中 | 有条件（宿主机，见任务 3） |
+| MIG | 硬件分区（SM+显存+缓存+带宽） | 强 | 强 | 实例间隔离（卡级硬件故障仍需单独评估） | 几乎无 | 低（规格固定） | ✗ T4 不支持，仅文档 |
+| HAMi | 用户态库（软件强制） | 硬上限（见 Day 1 术语） | 软配额 | 进程级独立，驱动/硬件级共享 | 低~中 | 高（任意切分） | ✓ |
 
 **GPU 碎片**：整数/切片资源在多服务混布时，调度策略决定"还能不能放下一个大的"。
 
@@ -260,22 +281,24 @@ vLLM 层：gpu-memory-utilization = 0.8 → vLLM 以"看到的总显存"为基�
 ### 动手任务
 
 1. 写 `notes/sharing-comparison.md`：上表 + 每条路线"什么场景选它"，MIG 部分单独标注为文档结论（含 A100 7 个 slice 的规格示例，以 NVIDIA 官方文档为准）
-2. **碎片实验（HAMi 调度策略）**：先查本机 HAMi 版本支持的节点/卡级调度策略注解（`hami.io/gpu-scheduler-policy` 一类，以本机文档为准）；按顺序提交若干 3000 / 6000 MiB 的小 Pod，再提交一个 12000 MiB 的"大模型" Pod：
-   - Binpack：大 Pod 能否调度成功？
-   - Spread：同样序列下呢？
-   记录 `describe pod` 的 Pending 原因与两张卡的显存分布
+2. **碎片实验（HAMi 卡级调度策略）**：本机是单节点，只有"卡级"策略有意义；先查本机 HAMi 版本支持的调度策略注解（`hami.io/gpu-scheduler-policy` 一类，以本机文档为准）。设单卡可分配显存为 C（以 HAMi 注册值为准，约 15 GiB），按**同一提交序列**分别在 Binpack 与 Spread 下各做一次：
+   - 序列：连续提交 4 个 3000 MiB 的小 Pod，再提交 1 个 12000 MiB 的"大模型"Pod（数值按 C 调整，保证"小 Pod 全部堆在一张卡后另一张整卡空闲"与"小 Pod 均分后单卡余量 < 12000"同时成立）
+   - 预期：Binpack 下 4 个小 Pod 堆在同一张卡（占 12000），大 Pod 能落到另一张整卡；Spread 下两张卡各占 6000，余量均不足 12000，大 Pod Pending
+   - 记录：每个 Pod 落在哪张卡、`describe pod` 的 Pending 原因、两张卡的显存分布
 3. （可选，有条件）**MPS 实验**：在维护窗口中把 `llm-lab-*` 其余负载全部停掉，在宿主机启动 MPS control daemon，起两个并发进程比较与"无 MPS 分时"的吞吐；**注意这会影响正被 HAMi 管理的卡，结束后必须关闭 daemon 并验证 HAMi 服务恢复**。时间不够直接跳过，写文档对比即可
 4. 拓扑感知（文档）：解释为什么 TP=2 在本机 `PHB`（无 NVLink）比 NVLink 机器慢，并写出 NVLink 亲和调度需要的节点信息（M3 Day 1/5 的拓扑与标签）
 
 ### 当天验收
 
 - [ ] 对比表可脱稿讲，且标清楚哪些是本机实测、哪些是文档
-- [ ] 碎片实验有 Binpack vs Spread 的对照数据
-- [ ] 能回答"为什么推理服务适合 Binpack，而容错要求高的多副本更偏 Spread"
+- [ ] 碎片实验有 Binpack vs Spread 的同序列对照数据
+- [ ] 能回答"什么情况选 Binpack、什么情况选 Spread，为什么大小模型分池比单一策略更稳"
 
 ### 验收参考答案
 
 > Binpack 的收益是把空闲整块留给将来的大请求，代价是同卡密度高、争用大、故障域集中；Spread 反之。**没有标准答案，取决于瓶颈**：显存碎片是主要矛盾（有大模型要上、卡紧张）→ Binpack；同卡争用/故障域是主要矛盾（多副本同一服务、要可用性）→ Spread，且要配反亲和确保同服务副本不上同一张卡。大型平台常见做法是"池分层"：小模型共享池用 Binpack，大模型独占池不切分，用池边界而不是单个策略解决冲突。
+>
+> 自测题"一张 A100 上跑三个业务怎么隔离"的参考思路：先按业务的 SLO 与信任关系分类——强 SLO 或互不信任的业务用 MIG 硬切分（显存、算力、故障域均隔离，代价是规格固定、不灵活）；同一信任域内、延迟不敏感的小业务可用 HAMi/MPS 在剩余实例内软切分，追求密度；三者都要先算清显存（M1 公式）能否装下。无论哪种，卡级硬件故障（Xid）仍是共同风险，要在 SLO 与告警里体现（M6）。
 
 ---
 
@@ -302,17 +325,17 @@ Cohort         ：多个 ClusterQueue 之间的借用/出借关系（公平共�
 WorkloadPriorityClass + preemption ：优先级与抢占策略
 ```
 
-**GPU 池的特殊性（HAMi 下）**：`nvidia.com/gpu` 此时计量的是 vGPU 切片数，而不是物理卡；`gpumem` 也是扩展资源。**配额口径要决定**：按 vGPU 数、按显存总量，还是两者同时约束——不同口径对"一个租户切了 1 个 15000 MiB 的 vGPU"产生完全不同的计费。
+**GPU 池的特殊性（HAMi 下）**：`nvidia.com/gpu` 此时计量的是 vGPU 切片数，而不是物理卡；`gpumem`、`gpucores` 也是扩展资源。**配额口径要决定**：按 vGPU 数、按显存总量、按算力份额，还是组合约束——不同口径对"一个租户切了 1 个 15000 MiB 的 vGPU"得出完全不同的占用量。
 
 ### 动手任务
 
-1. 安装 Kueue（helm 或官方 manifest，版本记录进 notes）；定义一个 `ResourceFlavor`（T4 池）
-2. 建两个团队队列 `team-a` / `team-b`，同一 Cohort，各自 nominalQuota（例：各 1 张卡对应的 vGPU+显存口径），`team-a` 设置 `borrowingLimit`
+1. 安装 Kueue（helm 或官方 manifest，版本记录进 notes）；定义一个 `ResourceFlavor`（T4 池）；在 ClusterQueue 的 `coveredResources` 中列出 `nvidia.com/gpu`、`nvidia.com/gpumem`（可选再加 `nvidia.com/gpucores`）
+2. 建两个团队队列 `team-a` / `team-b`，同一 Cohort。示例配额（数值按本机 HAMi 注册值调整）：每队 `nominalQuota` = `nvidia.com/gpu: 10`、`nvidia.com/gpumem: 15000`（约等于 1 张 T4）；`team-a` 额外设置 `borrowingLimit`（可借用 `team-b` 的空闲额度）
 3. 提交 Job（`kueue.x-k8s.io/queue-name` 标签）：
    - 在配额内：直接准入
    - 超出配额：Pending（查看 `Workload` 状态与原因）
-   - team-b 空闲时 team-a 借用其额度；team-b 来了触发回收/抢占，记录被抢占 Job 的行为
-4. 用 vLLM 负载（短寿命 Job 形态的批量推理，或 1.5B 服务）体验"服务也走队列"的限制：在线服务通常不适合被抢占，写出你的判断依据
+   - `team-b` 空闲时 `team-a` 借用其额度；`team-b` 提交作业后触发回收——**这要求 ClusterQueue 显式配置抢占策略**（如 `preemption.reclaimWithinCohort`，字段名以本机 Kueue 版本为准），否则借出的额度不会被收回；记录被抢占 Job 的行为
+4. 用 vLLM 负载（短寿命 Job 形态的批量推理，或 1.5B 服务）体验"服务也走队列"的限制：在线服务通常不适合被抢占，写出你的判断依据。**若本机 Kueue 版本不支持 Deployment/Pod 形态的集成，在线服务就只用 Job 形态演示排队，并在笔记中标注该限制**
 5. 产出 `queueing/kueue/` 配置集 + 实验记录
 
 ### 当天验收
@@ -324,7 +347,7 @@ WorkloadPriorityClass + preemption ：优先级与抢占策略
 ### 验收参考答案
 
 > Kueue 管"准不准开工"，调度仍由 hami-scheduler 完成，两者是上下游关系，所以兼容；Volcano 自己就是调度器，会和 hami-scheduler 争夺 Pod 的调度权，同一集群上要么分池（不同节点/不同 schedulerName 的工作负载），要么用 Volcano 自带的 vGPU 方案替代 HAMi。
-> 配额口径：只限 vGPU 数，租户可以通过"开很大的 gpumem"绕过；只限显存，则算力占比无约束。**生产建议至少两项同时约束（vGPU 数 + 显存），并把"按显存 × 时间"作为 M6 成本归因的计量基础。**
+> 配额口径：只限 vGPU 数，租户可以通过"开很大的 gpumem"绕过；只限显存，租户可以通过多开切片或占满 `gpucores` 来绕过算力份额。**生产建议至少同时约束 vGPU 数与 `gpumem`；若要保证算力份额，再加 `gpucores`。** 并把"按显存 × 时间"作为 M6 成本归因的计量基础。
 
 ---
 
@@ -348,11 +371,12 @@ Volcano 核心对象：`Queue`（队列与权重）、`PodGroup`（minMember 即
 
 ### 动手任务
 
-1. 在**隔离的命名空间**安装 Volcano；给节点增加一个自定义扩展资源（如 `example.com/fake-gpu: 4`，仅用于模拟），避免动真 GPU
-2. 复现死锁：用默认调度器提交两个各需 3 个 Pod 的 Job（总量超过 4），观察互相占着不放
-3. 换 Volcano + `PodGroup(minMember=3)`，对比同一场景：至少一个 Job 完整调度，另一个整体 Pending
+1. 在**隔离的命名空间**安装 Volcano；给节点增加一个自定义扩展资源（如 `example.com/fake-gpu: 4`，通过 patch 节点 `status.capacity` 实现，仅用于模拟），避免动真 GPU；记录安装与卸载步骤，以及节点 patch 的回滚方法
+2. **确定性地复现死锁**（默认调度器下两个 Job 的 Pod 调度先后不可控，直接同时提交不一定死锁）：两个 Job 各需 3 个 Pod、每个 1 个 `fake-gpu`。先让两个 Job 各启动 2 个 Pod（共占满 4 个），再让两个 Job 各补第 3 个 Pod——此时双方都缺 1 个、都拿不到，互相占着不放，永久 Pending
+3. 换 Volcano + `PodGroup(minMember=3)`，对比同一场景：至少一个 Job 完整调度，另一个整体 Pending（一个 Pod 都不占）
 4. 体验 Volcano `Queue` 的权重与 `reclaimable`，与 Day 5 的 Kueue 配额对照：**两者在"队列/优先级/抢占/公平共享"上各自的语义差别**
-5. 写 `notes/` 选型结论：什么场景选 Kueue、什么场景选 Volcano、什么场景两者都不需要（本机在线推理现状）
+5. 写 `queueing/queueing-selection.md`：什么场景选 Kueue、什么场景选 Volcano、什么场景两者都不需要（本机在线推理现状）
+6. **第一周收尾**：按 Day 0 的清单核对集群状态（节点 patch 回滚、Volcano 清理、`llm-lab-m5` 内实验资源保留/清理）；各实验的原始数据与笔记提交 Git；`vllm-qa`、`vllm-smoke` 保持缩容状态进入第二周（Day 7、8 仍需整卡）
 
 ### 第一周验收
 
@@ -385,20 +409,20 @@ LLM 推理   ：请求成本方差极大（10 token vs 10000 token）、有状�
 |---|---|---|
 | `vllm:num_requests_waiting` | 排队深度 | 过载的直接信号，优先避开 |
 | `vllm:num_requests_running` | 在跑请求数 | 粗粒度负载 |
-| `vllm:gpu_cache_usage_perc` | KV Cache 水位 | 容量视角，避免打满触发抢占 |
+| `vllm:gpu_cache_usage_perc`（新版 vLLM 改名为 `vllm:kv_cache_usage_perc`，**以本机 `/metrics` 为准**，M6 Day 3 同此约定） | KV Cache 水位 | 容量视角，避免打满触发抢占 |
 | 前缀命中情况 | 是否有该前缀的缓存 | 缓存亲和，命中则省 prefill |
 
 ### 动手任务
 
-1. 在 `llm-lab-m5` 部署**同一个 1.5B 模型的 2~3 个实例**（可一卡一个，也可借 HAMi 一卡两个），确保 `/metrics` 可采集
+1. 在 `llm-lab-m5` 部署**同一个 1.5B 模型的 2 个实例**（一卡一个，或借 HAMi 同卡两个；需要第 3 个实例时只能同卡共享），确保 `/metrics` 可采集。实例用同一 `servedName`，便于在网关里归入同一模型组
 2. 写 `router/load_gen.py`：生成**请求成本方差大**的负载（输出长度混合 32 / 512 token）和**共享前缀**负载（同一 system prompt + 不同问题），可调比例
-3. 基线：用 LiteLLM 现有路由策略（轮询/最少繁忙/按延迟，以本机版本支持为准）跑两种负载，记录 TTFT p50/p95/p99、各实例 waiting 的时间曲线、总吞吐
-4. 确认 `prefixCaching` 开关：前缀实验必须 `--enable-prefix-caching`，并在 notes 里说明 M2 里"v0.28 V1 默认开启"与 chart 默认关闭之间的统一口径
+3. 基线：在 LiteLLM 里把这两个实例配成**同一 `model_name` 下的两个 deployment**，分别用 LiteLLM 现有路由策略（`simple-shuffle` / `least-busy` / `latency-based` 等，以本机版本支持为准；注意 LiteLLM 默认是随机打散而非严格轮询）跑两种负载，记录 TTFT p50/p95/p99、各实例 `waiting` 的时间曲线、总吞吐
+4. 前缀实验需要打开 prefix caching：chart 的 `model.prefixCaching` 为 `false` 时会渲染 `--no-enable-prefix-caching`（见 `_helpers.tpl`），为 `true` 时不加任何参数、依赖 vLLM v0.28 V1 的默认开启；实验时设 `true`，并在 notes 里记录"以 `/metrics` 中前缀缓存相关指标有增长为实际生效的证据"，避免默认值口径含混
 
 ### 当天验收
 
-- [ ] 基线数据能说明"轮询下实例间负载不均"（waiting 曲线佐证）
-- [ ] 能说清为什么 LLM 请求成本方差使轮询失效
+- [ ] 基线数据能回答"轮询/随机打散下实例间负载是否不均"，以 `waiting` 曲线为证。**若实测并未出现明显不均，就调大请求成本方差或并发后复测，并如实记录（负结果同样是有效结论，不要为了迎合预期而改数据）**
+- [ ] 能说清为什么 LLM 请求成本方差会使轮询失效
 
 ### 验收参考答案
 
@@ -412,35 +436,42 @@ LLM 推理   ：请求成本方差极大（10 token vs 10000 token）、有状�
 
 Gateway API Inference Extension 的核心组件叫 **EPP（Endpoint Picker）**：网关收到请求后，把"选哪个后端 Pod"的决策外包给它，它基于后端指标做挑选。今天自己写一个最小版本，把机制吃透。
 
-路由器设计（够用即可）：
+路由器设计（够用即可），`prefix_aware` 策略的确定流程：
 
 ```text
+定义：
+  负载分数 load(i) = w1·waiting(i) + w2·running(i) + w3·kv_usage(i) + w4·inflight(i)
+  过载判定 overloaded(i) = waiting(i) > T_wait 或 kv_usage(i) > T_kv
+  （inflight 是路由器自己记录的"已转发未返回"请求数，用来补偿 metrics 拉取间隔内的滞后）
+
 请求 → 路由器
-  1. 取请求前缀（如 prompt 前 N 个字符/token 的哈希）
-  2. 前缀亲和：若某实例近期处理过该前缀 → 候选优先
-  3. 负载过滤：候选实例的 waiting / kv_cache_usage 超阈值 → 剔除
-  4. 在剩余实例中选最低负载；全超载时退化为最低负载
-  5. 转发（支持 SSE 流式透传）
+  1. 计算请求前缀哈希（prompt 前 N 个字符/token）
+  2. 查亲和表：prefix → 实例 A（表项带 TTL/LRU，过期即失效）
+  3. 若 A 存在且 not overloaded(A) → 选 A                    # 前缀亲和优先
+  4. 否则 → 在所有实例中选 load 最低者                         # 过载或无亲和时退回负载均衡
+  5. 把"该前缀 → 被选实例"写入亲和表；转发（SSE 流式透传）
 后台：每 1~2s 拉取各实例 /metrics 更新状态
 ```
 
-**关键权衡**：前缀亲和 vs 负载均衡会冲突——热点前缀会把某一实例压垮。阈值（"亲和最多容忍多高的负载"）是核心旋钮。
+**关键权衡**：前缀亲和与负载均衡会冲突——热点前缀会把某一实例压垮。`T_wait`、`T_kv`（"亲和最多容忍多高的负载"）是核心旋钮。
+
+**链路位置**：本日实验中客户端**直接请求路由器**，路由器再转发给各 vLLM 实例；LiteLLM 基线是客户端 → LiteLLM → vLLM。两条链路分别测，不叠加，避免两层路由互相干扰。Day 11 把路由器接入平台时，再让 LiteLLM 的 `api_base` 指向路由器。
 
 ### 动手任务
 
-1. 用 FastAPI + httpx 实现 `router/epp_lite.py`：后端列表可配、metrics 拉取、三种策略可切换（`round_robin` / `least_load` / `prefix_aware`）、SSE 透传、暴露自己的 `/metrics`（路由决策计数）
+1. 用 FastAPI + httpx 实现 `router/epp_lite.py`：后端列表可配、metrics 拉取、三种策略可切换（`round_robin` / `least_load` / `prefix_aware`，其中 `least_load` 使用上面的 `load(i)`）、SSE 透传、暴露自己的 `/metrics`（路由决策计数）
 2. 用 Day 7 的两种负载，对三种策略各跑 3 次，记录：
    - 共享前缀负载：**前缀缓存命中率**（vLLM `prefix_cache` 相关指标，名称以本机 `/metrics` 为准）、TTFT p50/p95
    - 方差大负载：各实例 waiting 曲线、p99 TTFT、总吞吐
-3. 调阈值：前缀亲和的负载容忍度从严到松，画 TTFT p95 随阈值变化的曲线，找到拐点
+3. 调阈值：把 `T_wait`/`T_kv`（亲和对负载的容忍度）从严到松，画 TTFT p95 随阈值变化的曲线，找到拐点
 4. 构造"热点前缀"：90% 请求共享同一前缀，观察 `prefix_aware` 是否让某实例过载，验证需要负载兜底
 5. 将结果写入 `router/results/` 与 `notes/gateway-api-inference.md` 的"自研验证"一节
 
 ### 当天验收
 
 - [ ] 路由器三种策略可切换且流式不被破坏
-- [ ] 对照数据显示：前缀感知提升命中率/降低 TTFT，负载感知降低尾延迟
-- [ ] 热点前缀实验证明了两种目标的冲突与兜底机制
+- [ ] 对照数据能回答：前缀感知相对 `round_robin` 对命中率/TTFT 的影响，负载感知相对 `round_robin` 对尾延迟的影响（预期分别改善，**以实测为准，结论为负也要解释原因**）
+- [ ] 热点前缀实验说明了两种目标的冲突与兜底机制
 
 ### 验收参考答案
 
@@ -479,7 +510,7 @@ EPP 的调度思路（与你 Day 8 的自研对照）：过滤（健康/容量�
 1. 读 GAIE 官方文档与 EPP 源码的调度插件部分（filter / scorer），整理一张"Day 8 自研路由器 vs EPP 插件"的对照表：哪些你已实现，哪些是生产必备但你没做
 2. （可选）在 k3s 安装 GAIE 的 CRD，创建一个 `InferencePool` 指向 Day 7 的实例，观察资源状态；完整 Gateway 数据面（Envoy 等）本机资源有限，按文档分析即可
 3. 写 `notes/llm-d-aibrix.md`：两个项目的架构要点、解决的问题、适用规模；**回答"本机现状（单节点、2 卡）该不该上这些项目"**
-4. 把 M4 Day 9 的"chart + LiteLLM 够用/需要 KServe"选型结论扩展一层：**需要推理感知路由的信号是什么（实例数 ≥ ?、前缀复用率 ≥ ?）**
+4. 把 M4 Day 9 的"chart + LiteLLM 够用/需要 KServe"选型结论扩展一层：**什么时候需要推理感知路由**。给出**数值阈值**（如"实例数 ≥ N、前缀复用率 ≥ X% 时前缀感知路由才有明显收益"），数值来自 Day 8 的实测曲线，不要留"？"占位；写进 `notes/gateway-api-inference.md`
 
 ### 当天验收
 
@@ -533,20 +564,22 @@ EPP 的调度思路（与你 Day 8 的自研对照）：过滤（健康/容量�
 ```text
 租户（团队 A）
   ├─ 身份与计费：LiteLLM 虚拟 key（M4 Day 9）→ token 限流 / 预算
-  ├─ 入口：网关 → 路由（Day 7/8 的感知路由）→ 后端池
+  ├─ 入口：网关 →（同一模型有多个副本时经 Day 7/8 的感知路由）→ 后端
   ├─ 命名空间：namespace + ResourceQuota + NetworkPolicy（M4 Day 9）
   ├─ 队列与配额：Kueue LocalQueue（Day 5）
   ├─ GPU 切片：HAMi gpumem/gpucores（Day 2/3）
   └─ 监控：vLLM /metrics + GPU 指标（M6 展开）
 ```
 
+**两层配额的关系（必须写清，否则会互相打架）**：Kueue 是"准入"层——超配额的作业排队等待；`ResourceQuota` 是 K8s 的"硬兜底"层——超额的 Pod 创建请求直接被拒绝。**`ResourceQuota` 的上限必须不低于该租户 Kueue 的 `nominalQuota + borrowingLimit`**，否则借用来的额度会被 `ResourceQuota` 拒绝，表现为 Pod 创建失败而不是排队。
+
 ### 动手任务
 
-1. 搭建两个模拟租户 `team-a` / `team-b`：各自命名空间、Kueue 队列、LiteLLM 虚拟 key（模型白名单 + TPM），后端是共享一张 T4 的两个 1.5B 实例
+1. 搭建两个模拟租户 `team-a` / `team-b`：各自命名空间（含上述两层配额）、Kueue 队列、LiteLLM 虚拟 key（模型白名单 + TPM）。**拓扑：每个租户各有一个自己的 1.5B 实例，两个实例共享同一张 T4**（模型名分别为 `qwen-1.5b-team-a`、`qwen-1.5b-team-b`，各租户的 key 只允许访问自己的模型名）。本日**不启用感知路由**（每个模型名只有一个实例，没有可选后端），路由器在架构图上标为"同一模型多副本时启用，Day 8 已单独验证"
 2. 端到端演练：
    - 正常流量：两租户并行使用，记录各自的 token 用量与延迟
    - `team-a` 超 TPM：被网关 429，`team-b` 不受影响
-   - `team-a` 申请超配额的 GPU 资源：Kueue 排队
+   - `team-a` 申请超配额的 GPU 资源：Kueue 排队（用 Job 形态演示；在线服务是否走 Kueue 取决于 Day 5 任务 4 的结论）
    - `team-a` 的服务压满：确认对 `team-b` 的影响（回扣 Day 3 的算力软隔离结论）
 3. **画架构图** `report/AI推理平台架构图.md`（mermaid 或 drawio 导出），分层：
    - 接入层：网关、鉴权、限流、路由（含推理感知路由）
@@ -565,7 +598,7 @@ EPP 的调度思路（与你 Day 8 的自研对照）：过滤（健康/容量�
 
 ### 验收参考答案
 
-> 一条完整路径：租户携带虚拟 key → 网关鉴权/限流/预算 → 推理感知路由选后端实例 → 后端 Pod 在租户命名空间，其 GPU 资源由 Kueue 准入（配额）、hami-scheduler 选卡、libvgpu 限显存/算力 → vLLM 内部再由 `max-num-seqs`/`max-model-len` 约束并发。**五层治理各管一件事：谁能进（鉴权）→ 进来多少（token 限流）→ 去哪里（路由）→ 能占多少资源（队列+切片）→ 进来怎么消化（引擎参数）**，缺任何一层都会在某个故障场景里暴露出来。
+> 一条完整路径：租户携带虚拟 key → 网关鉴权/限流/预算 →（同一模型多副本时由推理感知路由选后端实例）→ 后端 Pod 在租户命名空间，其 GPU 资源由 Kueue 准入（配额）、hami-scheduler 选卡、libvgpu 限显存/算力 → vLLM 内部再由 `max-num-seqs`/`max-model-len` 约束并发。**五层治理各管一件事：谁能进（鉴权）→ 进来多少（token 限流）→ 去哪里（路由）→ 能占多少资源（队列+切片）→ 进来怎么消化（引擎参数）**，缺任何一层都会在某个故障场景里暴露出来。
 
 ---
 
@@ -575,10 +608,12 @@ EPP 的调度思路（与你 Day 8 的自研对照）：过滤（健康/容量�
 
 模拟一次"资源紧张的一天"：
 
-1. 池中同时存在：共享池的两个小模型服务、一个 7B AWQ 在线服务、一个批量推理 Job
+0. **先做 GPU 预算表并核对闭合**：两张 T4 总共约 2 × 15 GiB。写出每张卡上放什么、各自 `gpumem`（例：卡 0 放两个 1.5B 租户实例；卡 1 放 `vllm-qa` 的 7B AWQ，并与批量 Job 共享，需先按 Day 2 容量表确认 7B AWQ 在缩小 `gpumem` 后仍能启动、剩余显存是否足够批量 Job）。**预算不闭合就先降规格**（如批量 Job 改用更小模型或排到 7B 服务缩容后），不要直接上演练
+1. 池中同时存在：共享池的两个小模型服务（Day 11 的两个租户实例）、一个 7B AWQ 在线服务（恢复 `vllm-qa`，按预算表重配 `gpumem`）、一个批量推理 Job
 2. 注入：批量 Job 提交 → 触发 Kueue 排队/抢占；同时某租户流量激增 → 路由与限流生效；邻居满压 → 观察 Day 3 预测的干扰
 3. 记录从注入到稳定的时间线，对照架构图找出：哪一层先饱和、哪一层成为第一故障点
 4. 复盘：如果要把这个池扩展到 8 卡 A100 多节点，哪些设计需要变（MIG 取代 HAMi？Volcano 取代 Kueue？NVLink 亲和？PD 分离？）
+5. **收尾**：保留双租户环境（两个租户实例、Kueue 配置、LiteLLM 虚拟 key、路由器与负载生成器），M6 的 Day 7、9、12 要复用。**GPU 占位**：保留的租户实例占着一张 T4，`vllm-qa` 占另一张，因此 `vllm-smoke` 在 M6 期间**继续保持缩容**（它的 `qwen-1.5b` 路由暂时不可用属预期，在 Day 0 清单里注明），M6 结束后再按清单恢复；`vllm-qa` 的 `gpumem` 等参数从 Day 12 演练配置恢复到 M4 `values-qa.yaml` 原值（M6 基准服务以原值为准）；网关对外的其他原有路由按清单恢复；清理不再需要的实验资源
 
 ### 最终自测题（脱稿回答）
 
