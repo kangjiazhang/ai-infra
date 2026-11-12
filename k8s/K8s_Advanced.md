@@ -333,11 +333,15 @@ spec:
         - -c
         - |
           echo "等待 MySQL 就绪..."
+          # busybox 镜像版本需确认包含 nc；端口可达不等于数据库已可完成查询。
+          # 生产中应使用带超时/重试上限的 mysqladmin ping 或专用迁移工具。
+          i=0
           until nc -z mysql 3306; do
+            i=$((i+1)); [ "$i" -ge 150 ] && exit 1
             echo "MySQL 尚未就绪，2 秒后重试..."
             sleep 2
           done
-          echo "MySQL 已就绪！"
+          echo "MySQL 端口已就绪"
     # Init 容器 2：初始化数据库表结构
     - name: migrate-db
       image: mysql:8.0
@@ -374,7 +378,7 @@ spec:
 | 资源限制 | `initContainers[].resources` | `containers[].resources` |
 | 探针 | ❌ 不支持 | ✅ 支持三种探针 |
 
-> **最佳实践**：Init 容器不要做长期运行的事（超过 1 分钟）。`activeDeadlineSeconds` 可以限制 Init 容器的总运行时间，超时则终止 Pod。
+> **最佳实践**：Init 容器应有明确的超时与重试上限，但不存在通用“不得超过 1 分钟”的规则。`activeDeadlineSeconds` 限制的是整个 Pod 从启动到完成的总时长，也会影响应用容器；若仅限制初始化步骤，优先在脚本/工具内部实现 timeout。
 
 ### 7 节点亲和性
 
@@ -689,7 +693,7 @@ kube-controller-manager 进程
 ├── Job Controller           ← watch Job 变化
 ├── Node Controller          ← watch Node 变化（心跳、状态）
 ├── EndpointSlice Controller ← watch Service → 生成 EndpointSlice
-├── ServiceAccount Controller← 自动创建 SA + Token
+├── ServiceAccount Controller← 确保命名空间存在 default SA；Token 由投射卷/TokenRequest 等机制提供
 └── Garbage Collector       ← 清理孤立资源
 ```
 
@@ -1044,9 +1048,9 @@ volumes:
 | 模式 | 行为 | 适用场景 |
 |------|------|----------|
 | `Immediate` | PVC 创建即绑定 PV（默认） | 不考虑调度位置 |
-| `WaitForFirstConsumer` | **Pod 调度后才创建和绑定** | 云盘需与 Pod 在同一 AZ |
+| `WaitForFirstConsumer` | 调度器评估首个消费者时再进行卷绑定或动态供给 | 云盘等具有 AZ/节点拓扑约束的存储 |
 
-> `WaitForFirstConsumer` 是生产必备：Pod 在 AZ-A → PV 也在 AZ-A 创建，避免跨 AZ 挂载云盘的高延迟。
+> `WaitForFirstConsumer` 常用于有拓扑约束的云盘，使卷拓扑与候选节点协调；它不是所有生产 StorageClass 的必备设置，NFS/CephFS 等共享存储应按驱动语义选择。
 
 **CSI 驱动原理**：CSI（Container Storage Interface）是标准化接口，将存储供应商插件与 K8s 核心解耦。分为三部分：CSI Controller（创建/删除/快照卷）+ CSI Node Plugin（挂载/卸载卷到节点）+ external-provisioner / external-attacher 等 sidecar 容器。
 
@@ -1101,19 +1105,19 @@ ConfigMap 被 Pod 引用后，更新行为取决于**注入方式**和**应用�
 ```
 kubectl apply ConfigMap
   → apiserver 写入 etcd
-  → kubelet watch 到变更（默认 sync period 60s）
-  → kubelet 原子写入新文件到 Pod 的 Volume 目录
-  → 应用读取新文件（何时生效取决于应用是否 reload）
+  → kubelet 的 ConfigMap/Secret 变更检测机制感知更新
+  → 在 Pod 同步周期刷新投射卷并原子切换文件
+  → 应用重新读取文件（何时生效取决于应用是否 reload）
 ```
 
-**关键参数**：
+**关键参数与边界**：
 
 | 参数 | 说明 |
 |------|------|
-| `kubelet --sync-frequency` | kubelet 同步周期，默认 1 分钟 |
-| ConfigMap TTL cache | kubelet 内部缓存，默认 1 分钟 |
+| `kubelet --sync-frequency` | kubelet Pod 同步周期；默认值应以目标版本配置为准 |
+| `configMapAndSecretChangeDetectionStrategy` | 常见为 `Watch`；也可配置 `Cache` 或 `Get` |
 
-> 从 `kubectl apply` 到 Pod 内文件更新，**最长约 90 秒**（60s sync + 30s cache TTL）。
+> 默认 Watch 策略下，更新延迟通常由 Watch 传播和 Pod 同步周期决定；只有使用 Cache 策略时才额外受缓存 TTL 影响。不要承诺固定“最长 90 秒”，应在目标集群实测。
 
 **原子写入原理**（kubelet atomic_writer）：
 
@@ -1205,6 +1209,8 @@ Reloader 会 watch ConfigMap 变化并自动执行 `rollout restart`。
 
 ```yaml
 # Sidecar 监听 ConfigMap 文件变化，通知主容器 reload 配置
+# 更推荐应用暴露受保护的 reload HTTP/Admin Socket；如需发进程信号，必须共享 PID namespace 并处理权限。
+shareProcessNamespace: true
 containers:
   - name: app
     image: my-app
@@ -1217,8 +1223,9 @@ containers:
     args:
       - |
         apk add inotify-tools
-        while inotifywait -e modify /etc/app/config/; do
-          kill -HUP $(pgrep my-app)   # 发送 SIGHUP 信号
+        while inotifywait -e create,delete,move,attrib -r /etc/app/config/; do
+          pid="$(pgrep -o my-app)" || continue
+          kill -HUP "$pid"            # 发送 SIGHUP；仍需满足进程权限
         done
     volumeMounts:
       - name: config
@@ -1237,7 +1244,7 @@ containers:
 
 | 注入方式 | 支持热更新 | Pod 内文件更新 | 生效条件 |
 |----------|-----------|---------------|---------|
-| Volume 目录挂载 | ✅ 支持 | 最长 ~90s | 应用自行 reload |
+| Volume 目录挂载 | ✅ 支持 | 异步更新，受检测策略和 kubelet 同步周期影响 | 应用自行 reload |
 | Volume + subPath | ❌ 不支持 | 不更新 | 重建 Pod |
 | 环境变量 | ❌ 不支持 | 不更新 | 重启 Pod |
 | envFrom | ❌ 不支持 | 不更新 | 重启 Pod |
@@ -1291,9 +1298,9 @@ data:
 |------|----------|------------|
 | `Prefix` | 路径前缀匹配 | 匹配 `/foo`, `/foo/`, `/foo/bar` |
 | `Exact` | 精确匹配 | 只匹配 `/foo` |
-| `ImplementationSpecific` | 由 Ingress Controller 决定 | Nginx 等同 Prefix |
+| `ImplementationSpecific` | 完全由 Ingress Controller 定义 | 可能支持控制器专属的前缀、正则或重写语义 |
 
-> 注意：`Prefix` 类型的行为在 K8s 1.18 前后不同——旧版本更宽松，新版本要求正则匹配。为可移植性，建议用 `Prefix` 并确保有分隔符。
+> 注意：`Prefix` 按 `/` 分隔的路径元素做前缀匹配，不是正则表达式；正则能力通常属于 Controller 专属注解与 `ImplementationSpecific` 行为。可移植规则优先使用 `Prefix` 或 `Exact`。
 
 ### 2 架构
 
@@ -1328,7 +1335,7 @@ kube-proxy（每个节点运行的守护进程）
   ▼
 Pod（CNI 分配的 Pod IP）
   │  跨节点流量由 CNI（Calico / Flannel / Cilium）处理
-  │  同节点流量走 docker0 / cni0 网桥直连
+  │  同节点数据路径由 CNI 决定：可能经过 Linux Bridge、主机路由、OVS/OVN、eBPF 或 ENI
   ▼
 Container（业务进程监听端口）
 ```
@@ -1399,7 +1406,7 @@ spec:
   ingressClassName: nginx    # 匹配 IngressClass.metadata.name
 ```
 
-> K8s 1.18+ 必须使用 `ingressClassName` 字段，旧的 `kubernetes.io/ingress.class` 注解已弃用。
+> Kubernetes 1.18+ 推荐使用 `ingressClassName`。该字段可以省略并由标记为默认的 `IngressClass` 接管；旧 `kubernetes.io/ingress.class` 注解已弃用，但兼容行为取决于具体 Controller。
 
 ---
 
@@ -1452,7 +1459,7 @@ $ kubectl get ns team-a -o jsonpath='{.spec.finalizers}'
 ["kubernetes"]
 ```
 
-**解决**：找出卡住的资源 → 移除 finalizer → 强制删除：
+**解决**：优先修复不可用的 APIService、Webhook 或负责 Finalizer 的 Controller，让其完成正常清理。只有确认 Finalizer 对应的外部资源已经人工清理，并明确接受孤儿资源、数据泄漏或残留云资源风险后，才可把下面的清空 Finalizer 命令作为最后手段：
 
 ```shell
 # 1. 列出 namespace 中所有资源
@@ -1567,7 +1574,7 @@ spec:
   automountServiceAccountToken: false  # 若不需要访问 API Server，关闭以提升安全
 ```
 
-> **注意**：Kubernetes 1.24+ 默认不再自动挂载 SA token 到每个 Pod，需显式声明或使用 `automountServiceAccountToken`。
+> **注意**：Kubernetes 1.24 主要是不再自动为 ServiceAccount 创建长期 Secret Token。Pod 默认仍可通过 projected volume 获得有期限、可轮换的 Token；不需要访问 API Server 时，应设置 `automountServiceAccountToken: false`。
 
 #### 2.2 Role（角色）& ClusterRole（集群角色）
 
@@ -1644,8 +1651,8 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
-> **重要**：`ClusterRoleBinding` 绑定后，SA 对该 ClusterRole 中所有资源的访问覆盖全集群。
-> 若只想用 ClusterRole 但限制到特定命名空间，应使用 `RoleBinding` + `ClusterRole`。
+> **重要**：`ClusterRoleBinding` 绑定后，主体对该 ClusterRole 中所有资源的访问覆盖全集群。
+> 若只想复用 ClusterRole 规则但限制到特定命名空间，应使用 `RoleBinding` + `ClusterRole`。另外，授予创建 Pod/Workload 的权限可能让用户通过挂载 Secret、选择高权限 ServiceAccount、privileged/hostPath 等路径间接提权；必须同时使用专用低权限 SA、Pod Security Admission 和准入策略限制敏感字段。
 
 #### 2.4 常见 verbs
 
@@ -1673,6 +1680,8 @@ metadata:
   name: team-a
 ---
 # 创建 ServiceAccount
+# 注意：ServiceAccount 是工作负载身份，不应直接作为人类开发者登录凭据；
+# 人员访问应优先接入 OIDC/企业身份，并通过 Group 绑定 Role。
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -1944,7 +1953,7 @@ spec:
 | `maxReplicas` 合理 | 防止打爆集群 |
 | 设置缩容稳定窗口 | 防止抖动（至少 300s） |
 | requests ≈ 典型负载 | 否则利用率计算不准确 |
-| 配合 PDB 使用 | 保证缩容不中断服务 |
+| 配合优雅终止与可用性策略 | HPA 缩容不受 PDB 直接保护，应使用 readiness、preStop、终止宽限期和缩容稳定窗口降低中断 |
 | 预扩容 | 流量高峰前用 CronJob 提前扩容 |
 
 ---
@@ -2032,28 +2041,23 @@ spec:
 
 Kubernetes 根据 Pod 中容器的 requests/limits 自动划分 QoS 等级：
 
-| 等级 | 条件 | 驱逐优先级 |
-|------|------|------------|
-| **Guaranteed** | 每个容器的 CPU/Memory 的 `requests == limits`（且均设置） | 最低（最后被驱逐） |
-| **Burstable** | 至少有一个容器设置了 requests，但不满足 Guaranteed 条件 | 中等 |
-| **BestEffort** | 没有任何容器设置 requests 或 limits | 最高（最先被驱逐） |
+| 等级 | 条件 | 节点压力驱逐时的相对保护 |
+|------|------|--------------------------|
+| **Guaranteed** | 每个容器的 CPU/Memory 均设置，且对应 `requests == limits` | 通常最高，但仍可能因超 limit、系统 OOM 或更高优先级压力而终止 |
+| **Burstable** | 至少有一个容器设置了 requests 或 limits，但不满足 Guaranteed | 取决于实际用量相对 request、Priority 等因素 |
+| **BestEffort** | 没有任何容器设置 CPU/Memory requests 或 limits | 通常最低 |
 
-> **生产关键**：核心服务务必设置为 **Guaranteed** 级别，避免节点资源紧张时被 OOM Killer 杀死。
+> **生产关键**：核心服务应合理设置 requests/limits，但 Guaranteed 不等于“不会 OOM”。容器超过 memory limit 仍会被 cgroup OOMKill；节点压力还可能触发 kubelet eviction。
 
-#### 3.1 OOM Killer 与 QoS 的定量关系
+#### 3.1 区分容器 OOM、系统 OOM 与 kubelet Eviction
 
-当节点内存不足时，kubelet 按以下 **OOM Score** 机制驱逐 Pod：
+| 场景 | 触发者 | 典型现象 | 主要依据 |
+|------|--------|----------|----------|
+| 容器超过 memory limit | cgroup / 内核 | 容器 `OOMKilled`，Pod 可被重启 | 容器 memory limit |
+| 节点系统 OOM | Linux OOM Killer | 内核选择进程终止 | 进程 `oom_score` + `oom_score_adj` 等 |
+| 节点压力驱逐 | kubelet eviction manager | Pod 进入 `Evicted` | eviction threshold、QoS、Priority、相对 request 用量 |
 
-| QoS 等级 | OOM Score | 算法 |
-|----------|-----------|------|
-| **Guaranteed** | -998 | 固定最低分（几乎不会被 OOM Kill） |
-| **Burstable** | 2 ~ 999 | `min(max(2, 1000 - 请求内存/节点容量 × 1000), 999)` |
-| **BestEffort** | 1000 | 固定最高分（第一个被杀死） |
-
-**举例**：节点 16Gi，Burstable Pod A 请求 1Gi，Pod B 请求 4Gi：
-- Pod A OOM Score ≈ `1000 - (1/16 × 1000)` ≈ **937**
-- Pod B OOM Score ≈ `1000 - (4/16 × 1000)` ≈ **750**
-- Pod B 更"安全"——requests 声明越大，越不容易被杀死。
+`oom_score_adj` 是容器/进程级计算，并非简单给整个 QoS 固定一个绝对分数。Burstable 的调整值与容器 memory request 相对节点容量有关，实际受 Kubernetes 版本、运行时和进程情况影响；排障时应结合 Pod 事件、容器终止原因、kubelet 日志及内核日志判断。
 
 ```yaml
 # Guaranteed 示例
@@ -2165,14 +2169,18 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
-    # 允许 DNS 查询（通常需要）
+    # 允许 kube-system 中 CoreDNS 的 UDP/TCP 53；大响应和回退可能使用 TCP
     - to:
-        - namespaceSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
           podSelector:
             matchLabels:
               k8s-app: kube-dns
       ports:
         - protocol: UDP
+          port: 53
+        - protocol: TCP
           port: 53
 ```
 
@@ -2302,7 +2310,7 @@ spec:
 
 ### 3 Pod Disruption Budget（PDB）
 
-保护应用在**主动驱逐**（节点维护、集群升级、HPA 缩容）时不低于最少可用副本数。
+限制通过 Kubernetes Eviction API 发起的 **voluntary disruption**（如 `kubectl drain`）在同一时刻破坏过多副本。PDB 不直接保护 HPA 缩容、控制器按副本数缩容、直接删除 Pod、节点故障或容器 OOM；滚动更新主要受工作负载控制器自身的 `maxUnavailable/maxSurge` 约束。
 
 ```yaml
 apiVersion: policy/v1
@@ -2603,10 +2611,11 @@ Green（新版本）:    replicas=5, 标签 version=green
 $ kubectl cordon k8s-node2
 
 # 2. 驱逐现有 Pod 到其他节点
+# DaemonSet Pod 不驱逐；允许删除 emptyDir 数据；优雅终止等待 60 秒
 $ kubectl drain k8s-node2 \
-    --ignore-daemonsets \       # DaemonSet Pod 无法驱逐
-    --delete-emptydir-data \    # 允许清理 emptyDir 数据
-    --grace-period=60           # 优雅终止等待时间
+    --ignore-daemonsets \
+    --delete-emptydir-data \
+    --grace-period=60
 
 # 3. 执行维护操作（升级内核、换硬盘等）
 
@@ -2638,24 +2647,21 @@ $ ETCDCTL_API=3 etcdctl snapshot status /backup/etcd-snapshot-20240601.db --writ
 
 #### 2.2 恢复
 
-```shell
-# 在所有控制平面节点停止 kube-apiserver
-$ mkdir -p /var/lib/etcd-restore
-$ ETCDCTL_API=3 etcdctl snapshot restore /backup/etcd-snapshot-20240601.db \
-    --data-dir=/var/lib/etcd-restore \
-    --name=k8s-node1 \
-    --initial-cluster=k8s-node1=https://10.15.0.5:2380 \
-    --initial-advertise-peer-urls=https://10.15.0.5:2380
+```text
+以下简化思路仅适用于单控制平面、单成员 stacked etcd，不能直接复制到 HA 集群：
+1. 隔离旧集群并停止 API Server/etcd 写入，保留原数据目录作为回退。
+2. 使用与目标 etcd 版本匹配的 `etcdutl snapshot restore`（旧版本可能使用 `etcdctl`）。
+3. 恢复时核对 member name、peer URL、cluster token、data-dir 及 static Pod 配置。
+4. 同时核对 etcd 的 `--data-dir`、volumeMount.mountPath 与 hostPath.path，不能只改 hostPath。
+5. 启动后执行 endpoint status/health，并验证 API Server、资源数量和关键控制器。
 
-# 修改 etcd.yaml 的 data-dir 指向 /var/lib/etcd-restore
-$ vim /etc/kubernetes/manifests/etcd.yaml
-# 修改:
-#   volumes:
-#     - hostPath:
-#         path: /var/lib/etcd-restore    # 原为 /var/lib/etcd
+HA stacked etcd 或 external etcd：
+- 禁止复用单成员的 `--initial-cluster` 参数；
+- 每个成员需要唯一 name/peer URL，并提供完整 initial-cluster；
+- 必须按目标 Kubernetes/etcd 版本官方灾备流程逐成员恢复或重建集群。
 ```
 
-> **警告**：恢复 etcd 是高风险操作，务必在维护窗口内执行，并先在测试环境验证流程。
+> **警告**：etcd 恢复会改写集群状态，是高风险操作。必须在维护窗口中先完成离线演练、备份校验、回滚方案和版本矩阵确认。
 
 ### 3 kubeadm 集群升级
 
@@ -2710,9 +2716,10 @@ $ kubeadm certs check-expiration
 # 手动续期证书（到期前执行）
 $ kubeadm certs renew all
 
-# 续期后重启控制平面组件
-$ systemctl restart kubelet
-$ # 静态 Pod (apiserver/controller-manager/scheduler) 会自动重启
+# HA 集群需在每个控制平面节点分别续期，并逐节点重启使用这些证书的组件。
+# 仅重启 kubelet 不保证未变化的 static Pod 被重建；应按当前 kubeadm 官方流程，
+# 将对应 manifest 临时移出 /etc/kubernetes/manifests，等待 static Pod 停止后再移回。
+# 每个节点完成后验证 etcd、apiserver、controller-manager 与 scheduler 健康，再处理下一节点。
 ```
 
 ---
@@ -2733,14 +2740,14 @@ $ # 静态 Pod (apiserver/controller-manager/scheduler) 会自动重启
 │   (采集+存储) │         │  (Pod/Node)  │
 └──────┬───────┘         └──────────────┘
        │
-       ├──▶ Grafana     (可视化查询)
+       ├──▶ Grafana     (通过 Prometheus HTTP API 查询)
        │
-       └──▶ AlertManager (告警评估后推送)
+       └──▶ Alertmanager (接收 Prometheus 推送的告警)
               │
               ▼
          企业微信 / 钉钉 / Slack
 ```
-> 注意：Grafana 和 AlertManager 都直连 Prometheus，二者互不依赖。AlertManager 只负责告警路由，不存储数据。
+> 注意：Grafana 主动查询 Prometheus；Prometheus 负责评估规则并主动将告警发送给 Alertmanager。Alertmanager 不查询 Prometheus，主要负责分组、去重、抑制、静默和通知路由。
 
 #### 1.2 快速部署（使用 Helm）
 
@@ -2749,17 +2756,27 @@ $ # 静态 Pod (apiserver/controller-manager/scheduler) 会自动重启
 $ helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 $ helm repo update
 
-# 安装 kube-prometheus-stack（包含 Prometheus + Grafana + AlertManager）
-$ helm install monitoring prometheus-community/kube-prometheus-stack \
+# 预先在 monitoring 命名空间创建 grafana-admin-credentials（优先由密钥系统管理），再安装 Chart
+$ kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+# 示例仅演示键名；不要把真实密码写进 Git/Shell 历史
+$ kubectl create secret generic grafana-admin-credentials -n monitoring \
+    --from-literal=admin-user=admin \
+    --from-file=admin-password=/secure/path/grafana-admin-password \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+# 安装 kube-prometheus-stack（包含 Prometheus + Grafana + Alertmanager）
+$ helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
     --namespace monitoring \
     --create-namespace \
-    --set grafana.adminPassword=admin123 \
+    --set grafana.admin.existingSecret=grafana-admin-credentials \
+    --set grafana.admin.userKey=admin-user \
+    --set grafana.admin.passwordKey=admin-password \
     --set prometheus.prometheusSpec.retention=15d \
     --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.storageClassName=nfs-client \
     --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=50Gi
 
-# 查看 Grafana 密码
-$ kubectl get secret monitoring-grafana -n monitoring -o jsonpath="{.data.admin-password}" | base64 -d
+# grafana-admin-credentials 应由 External Secrets、Sealed Secrets 或其他密钥流程预先创建
+$ kubectl get secret grafana-admin-credentials -n monitoring
 ```
 
 #### 1.3 访问 Grafana
@@ -2796,48 +2813,51 @@ kube_deployment_status_replicas_available{job="kube-state-metrics"}
 ### 3 关键告警规则
 
 ```yaml
-apiVersion: v1
-kind: ConfigMap
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
 metadata:
   name: custom-alerts
   namespace: monitoring
-data:
-  alerts.yml: |
-    groups:
-      - name: kubernetes-apps
-        rules:
-          - alert: PodCrashLooping
-            expr: rate(kube_pod_container_status_restarts_total[15m]) > 0
-            for: 5m
-            labels:
-              severity: warning
-            annotations:
-              summary: "Pod {{ $labels.pod }} is crash looping"
+  labels:
+    release: monitoring   # 必须匹配 Prometheus CR 的 ruleSelector
+spec:
+  groups:
+    - name: kubernetes-apps
+      rules:
+        - alert: PodRestartingFrequently
+          expr: increase(kube_pod_container_status_restarts_total[15m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} frequently restarting"
 
-          - alert: DeploymentReplicasMismatch
-            expr: kube_deployment_spec_replicas != kube_deployment_status_replicas_available
-            for: 10m
-            labels:
-              severity: critical
-            annotations:
-              summary: "Deployment {{ $labels.deployment }} replicas mismatch"
+        - alert: DeploymentReplicasMismatch
+          expr: kube_deployment_spec_replicas != kube_deployment_status_replicas_available
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} replicas mismatch"
 
-          - alert: NodeHighCPU
-            expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
-            for: 5m
-            labels:
-              severity: warning
-            annotations:
-              summary: "Node {{ $labels.instance }} CPU > 80%"
+        - alert: NodeHighCPU
+          expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Node {{ $labels.instance }} CPU > 80%"
 
-          - alert: PersistentVolumeFilling
-            expr: kubelet_volume_stats_available_bytes / kubelet_volume_stats_capacity_bytes < 0.1
-            for: 5m
-            labels:
-              severity: critical
-            annotations:
-              summary: "PV {{ $labels.persistentvolumeclaim }} < 10% free"
+        - alert: PersistentVolumeFilling
+          expr: kubelet_volume_stats_available_bytes / kubelet_volume_stats_capacity_bytes < 0.1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} < 10% free"
 ```
+
+> 普通 ConfigMap 不会被 kube-prometheus-stack 自动当作规则加载。优先使用 `PrometheusRule`，并确认其标签/命名空间被 Prometheus CR 的 `ruleSelector` 与 `ruleNamespaceSelector` 选中。
 
 ### 4 日志收集方案
 
@@ -2929,7 +2949,7 @@ $ kubectl create secret tls my-tls-secret \
 # Ingress Controller 检测到 Secret 变化后热加载，约 30s 生效
 
 # 4. 长期方案：设置 Prometheus 告警监控剩余天数
-# probe_ssl_earliest_cert_expiry - time()) / 86400 < 30
+# (probe_ssl_earliest_cert_expiry - time()) / 86400 < 30
 ```
 
 > **原理**：Ingress Controller 通过 watch API Server 监听 Secret 变化，秒级自动重载。无需重启 Pod。
@@ -2994,6 +3014,7 @@ kind: Ingress
 metadata:
   name: rewrite-ingress
   annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
 spec:
   ingressClassName: nginx
@@ -3074,16 +3095,16 @@ metadata:
     nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,172.16.0.0/12"
 ```
 
-### 7 Gateway API 简介
+### 7 Gateway API
 
-Gateway API 是 Kubernetes 社区推进的下一代 Ingress 标准，提供了更灵活、面向角色的路由模型：
+Gateway API 的 `Gateway`、`GatewayClass`、`HTTPRoute` 等核心资源已进入 GA，并被多种网关实现支持；是否可用仍取决于已安装的 CRD 和 Controller。它提供更强的角色分离、跨命名空间授权和结构化路由能力。
 
 ```
-Ingress (当前)              Gateway API (未来)
-─────────────              ─────────────────
-单个 Ingress 资源            GatewayClass → Gateway → HTTPRoute
-注解满天飞                  原生字段表达
-路由规则混杂                面向角色（基础设施 / 应用开发者分离）
+Ingress                      Gateway API
+─────────────                ─────────────────────────────
+单个 Ingress 资源             GatewayClass → Gateway → HTTPRoute
+大量能力依赖实现专属注解       更多能力由标准字段表达
+基础设施与应用路由边界较弱      面向角色分离，并通过 ReferenceGrant 控制跨命名空间引用
 ```
 
 **资源层级**：
@@ -3095,8 +3116,8 @@ Ingress (当前)              Gateway API (未来)
 | `HTTPRoute` | 应用开发者 | 定义路由规则 |
 
 ```yaml
-# Gateway + HTTPRoute 示例（需先安装 Gateway API CRD）
-apiVersion: gateway.networking.k8s.io/v1beta1
+# HTTPRoute 示例（需先安装 Gateway API CRD 和实现它的 Controller）
+apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: app-route
@@ -3202,7 +3223,10 @@ spec:
         openAPIV3Schema: {...}   # OpenAPI v3 Schema 校验
       subresources:
         status: {}               # 启用 /status 子资源
-        scale: {}                # 启用 /scale 子资源（需配合 spec.replicas）
+        scale:
+          specReplicasPath: .spec.replicas
+          statusReplicasPath: .status.replicas
+          labelSelectorPath: .status.labelSelector
       additionalPrinterColumns:  # kubectl get 的额外列
         - name: Status
           type: string
@@ -3292,7 +3316,7 @@ subresources:
 
 | 子资源 | 作用 | 为什么重要 |
 |---|---|---|
-| `/status` | 读写分离 | 用户不能直接修改 Status，只有 Controller 能写；避免用户伪造部署状态 |
+| `/status` | Spec/Status 写路径分离 | 谁能写由 `/status` 子资源的 RBAC 权限决定；Controller 通常被授予更新权限，普通用户通常不应拥有 |
 | `/scale` | 扩缩容 | 供 HPA 使用，需 CR 有 `spec.replicas` 和 `status.replicas` 字段 |
 
 **内存视角理解 /status 分离**：
@@ -3382,10 +3406,10 @@ func (h *ConversionHandler) Convert(req *apiextensionsv1.ConversionRequest) *api
 ```
 
 **面试要点**：
-- `served: true` + `deprecated: true`：旧版本仍可读但不能创建
-- `served: false`：版本完全下线，旧 CR 无法通过 API 访问
-- `storage: true`：只有一个版本是存储版本，etcd 中只存一份
-- Conversion Webhook 是双向的（v1alpha1↔v1 互相转），Controller 必须实现
+- `served: true` + `deprecated: true`：该版本仍可通过 API 读写，但客户端会收到弃用警告
+- `served: false`：该版本不再由 API 提供；下线前应确认对象已迁移且客户端不再使用
+- `storage: true`：只能有一个存储版本；已有对象切换 storage 版本后仍需执行存储迁移才会重写
+- Conversion Webhook 负责 served 版本与 hub/storage 表示之间的转换；通常由独立 Webhook 服务实现，不等于 Reconcile Controller 本身必须实现
 
 #### 2.3 Status 与 Conditions（结构化状态）
 
@@ -3514,9 +3538,9 @@ Reflector ──▶ Indexer (本地线程安全缓存，避免每次 List API Se
 EventHandler ──▶ WorkQueue (key = namespace/name)
     │                │
     │           RateLimitingQueue
-    │           ├── 指数退避 (1s → 2s → 4s → 8s → ...)
-    │           ├── 最大重试次数 (超过则丢弃)
-    │           └── 令牌桶限速 (控制 API Server 写入频率)
+    │           ├── 按配置的 RateLimiter 退避（具体初值/上限依实现与版本）
+    │           ├── 默认不会替业务自动设定最大重试次数
+    │           └── 可组合指数退避与令牌桶，限制失败 key 的重入队速率
     │
     ▼
 Worker Pool (MaxConcurrentReconciles 并发)
@@ -3634,13 +3658,18 @@ status:
 Manager 是控制器运行时的顶层管理器：
 
 ```go
+// 示例基于现代 controller-runtime；实际项目必须锁定版本并按该版本 API 编译验证。
 mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-    Scheme:                 scheme,          // 注册已知资源类型
-    MetricsBindAddress:     ":8080",         // Prometheus metrics
-    HealthProbeBindAddress: ":8081",         // 健康检查
-    LeaderElection:         true,            // 多副本选主
+    Scheme: scheme,
+    Metrics: metricsserver.Options{
+        BindAddress: ":8080",
+    },
+    HealthProbeBindAddress: ":8081",
+    LeaderElection:         true,
     LeaderElectionID:       "game-operator",
-    Port:                   9443,            // Webhook 端口
+    WebhookServer: webhook.NewServer(webhook.Options{
+        Port: 9443,
+    }),
 })
 ```
 
@@ -3659,27 +3688,21 @@ func init() {
 }
 ```
 
-**如果没有注册 Scheme**：controller-runtime 的 client 无法对该类型的对象进行 Get/List/Create/Update，Reconcile 中任何操作都会 panic。
+**如果没有注册 Scheme**：controller-runtime client 对该类型执行 Get/List/Create/Update 通常会返回“类型未注册”错误；只有代码主动 `Must`、`panic` 或忽略错误时才可能导致进程异常。
 
 #### 4.4 Controller 注册
 
 ```go
 func (r *GameTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
     return ctrl.NewControllerManagedBy(mgr).
-        For(&gamev1.GameTask{}).        // ① 主资源
-        Owns(&batchv1.Job{}).           // ② 子资源（OwnerReference 关联）
-        Watches(                         // ③ 外部资源
-            &source.Kind{Type: &corev1.ConfigMap{}},
+        For(&gamev1.GameTask{}).                // ① 主资源；保留删除与 Finalizer 更新事件
+        Owns(&batchv1.Job{}).                   // ② 子资源：保留 Job Status 更新事件
+        Watches(                                // ③ 外部资源
+            &corev1.ConfigMap{},
             handler.EnqueueRequestsFromMapFunc(r.findObjectsForConfigMap),
         ).
         WithOptions(controller.Options{
-            MaxConcurrentReconciles: 4,  // ④ 并发 Worker 数
-        }).
-        WithEventFilter(predicate.Funcs{ // ⑤ 事件过滤
-            UpdateFunc: func(e event.UpdateEvent) bool {
-                // 只在 Spec 变化时触发（Status 变化不触发）
-                return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
-            },
+            MaxConcurrentReconciles: 4,         // ④ 并发 Worker 数
         }).
         Complete(r)
 }
@@ -3691,7 +3714,7 @@ func (r *GameTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 | `Owns()` | 子资源，子资源变化会通过 OwnerReference 反向触发父资源的 Reconcile |
 | `Watches()` | 监听与主 CR 没有 OwnerReference 的外部资源 |
 | `MaxConcurrentReconciles` | 并发 Worker 数，默认 1。数据库写密集型可设为 1，计算密集型可增加 |
-| `WithEventFilter` | 按需过滤事件，避免无效 Reconcile |
+| Predicate | 优化前先保证删除、Finalizer、子资源 Status 与外部资源事件不会被过滤；错误过滤比重复 Reconcile 更危险 |
 
 #### 4.5 Reconcile 实现模板
 
@@ -3735,6 +3758,12 @@ func (r *GameTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
             return ctrl.Result{}, err
         }
         logger.Info("Created Job", "jobName", job.Name)
+    }
+    for i := range toDelete {
+        if err := r.Delete(ctx, &toDelete[i]); err != nil && !apierrors.IsNotFound(err) {
+            logger.Error(err, "Failed to delete Job", "jobName", toDelete[i].Name)
+            return ctrl.Result{}, err
+        }
     }
 
     // ========== 6. 更新 Status ==========
@@ -3801,12 +3830,14 @@ func (r *GameTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 ```
 
 ```go
-// 手动 Requeue
-return ctrl.Result{Requeue: true}, nil               // 立即重试
-return ctrl.Result{RequeueAfter: 30 * time.Second}, nil // 30 秒后重试
-return ctrl.Result{}, err                            // 用 RateLimiter 重试
-return ctrl.Result{}, nil                            // 不重试
+// controller-runtime 不同版本的 Result API 有差异，项目必须锁定依赖版本。
+// 推荐语义：临时失败返回 error 进入 RateLimiter；轮询外部异步状态使用 RequeueAfter；完成返回 nil。
+return ctrl.Result{}, err                                  // 临时失败：按 RateLimiter 重试
+return ctrl.Result{RequeueAfter: 30 * time.Second}, nil    // 30 秒后再次调和
+return ctrl.Result{}, nil                                  // 当前调和完成，不主动重排
 ```
+
+> 不要把 `Requeue: true` 理解为稳定的“立即重试”业务 API；它在不同 controller-runtime 版本中可能已弃用或语义变化。永久错误应写入 Status/Condition、记录 Event，并显式停止无意义重试。
 
 #### 5.3 Finalizer：资源删除保护
 
@@ -3892,13 +3923,17 @@ GameTask CR (owner)
 ```
 
 ```go
-// kubebuilder 自动生成
-ctrl.NewManager(ctrl.Options{
+leaseDuration := 15 * time.Second
+renewDeadline := 10 * time.Second
+retryPeriod := 2 * time.Second
+
+mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+    Scheme:           scheme,
     LeaderElection:   true,
-    LeaderElectionID: "game-operator.example.com",  // 全局唯一
-    LeaseDuration:    15 * time.Second,              // Leader 心跳超时
-    RenewDeadline:    10 * time.Second,              // 续约超时
-    RetryPeriod:      2 * time.Second,               // 重试间隔
+    LeaderElectionID: "game-operator.example.com", // 在该锁命名空间内唯一
+    LeaseDuration:    &leaseDuration,
+    RenewDeadline:    &renewDeadline,
+    RetryPeriod:      &retryPeriod,
 })
 ```
 
@@ -4023,6 +4058,7 @@ webhooks:
         apiVersions: ["v1"]
         resources: ["pods"]
     failurePolicy: Fail       # Ignore（允许失败）/ Fail（拒绝请求）
+    timeoutSeconds: 5
     sideEffects: None
     admissionReviewVersions: [v1]
 ---
@@ -4037,12 +4073,16 @@ webhooks:
         name: sidecarset-webhook-service
         namespace: game-system
         path: /validate-tkex-tencent-com-v1alpha1-sidecarset
+      caBundle: <base64-encoded-ca-cert>
     rules:
       - operations: [CREATE, UPDATE]
         apiGroups: [tkex.tencent.com]
         apiVersions: [v1alpha1]
         resources: [sidecarsets]
     failurePolicy: Fail
+    timeoutSeconds: 5
+    sideEffects: None
+    admissionReviewVersions: [v1]
 ```
 
 ---
@@ -4164,9 +4204,13 @@ var (
 告警规则（Prometheus）：
 
 # Reconcile 错误率 > 1%
-rate(controller_reconcile_total{result="error"}[5m])
-  /
-rate(controller_reconcile_total[5m]) > 0.01
+sum by (controller) (
+  rate(controller_reconcile_total{result="error"}[5m])
+)
+/
+sum by (controller) (
+  rate(controller_reconcile_total[5m])
+) > 0.01
 
 # WorkQueue 深度 > 100 且持续 10 分钟
 controller_workqueue_depth > 100
@@ -4290,7 +4334,7 @@ spec:
 | `CrashLoopBackOff` | 应用启动失败、探针失败 | `kubectl logs -f --previous` |
 | `ImagePullBackOff` | 镜像不存在、仓库认证失败 | `kubectl describe pod` |
 | `Evicted` | 节点资源耗尽被驱逐 | `kubectl describe pod` |
-| `Terminating` | 卡在终止过程 | `kubectl delete pod --force --grace-period=0` |
+| `Terminating` | Finalizer、卷卸载、节点失联或 kubelet 异常 | 先检查 `deletionTimestamp`、Finalizer、Node 与卷状态；仅在确认旧进程停止且接受孤儿资源风险后才考虑强删 |
 | `Init:Error` | Init 容器失败 | `kubectl logs <pod> -c <init-container>` |
 
 ### 2 常用排查命令
@@ -4717,7 +4761,7 @@ apps/                          # 这是 app-of-apps 指向的目录
 |------|------|
 | 清单与源码分离 | 应用代码一个仓库，部署清单另一个仓库 |
 | 分支保护 | main 分支禁止直接 push，要求 PR + 审批 |
-| Sync Policy 谨慎使用 `selfHeal` | 紧急手动修复不会被自动回退（建议只在 staging 启用） |
+| `selfHeal` | 会把集群中的手工偏离自动改回 Git 期望状态；紧急手工修改可能被覆盖，应先暂停自动同步或通过 Git 提交修复 |
 | Secrets 不要明文存 Git | 使用 Sealed Secrets / External Secrets Operator / Vault |
 | 配合 Image Updater | ArgoCD Image Updater 自动更新镜像 tag |
 | 通知集成 | 配置 Slack / Webhook 通知部署状态 |
@@ -4928,7 +4972,7 @@ CSI（Container Storage Interface）将存储厂商插件与 K8s 核心解耦，
 | 服务 | 运行位置 | 职责 |
 |------|----------|------|
 | **Identity** | Controller + Node | 返回驱动信息和能力 |
-| **Controller** | Deployment (单副本) | 创建/删除/快照/扩容云盘 |
+| **Controller** | Deployment（可多副本） | 创建/删除/快照/扩容云盘；有副作用的 Sidecar 通常通过 Leader Election 保证单活 |
 | **Node** | DaemonSet (每节点) | 挂载/卸载/格式化到 Pod |
 
 **CSI Sidecar 容器（由 external-provisioner 等注入）**：
@@ -4942,41 +4986,59 @@ CSI（Container Storage Interface）将存储厂商插件与 K8s 核心解耦，
 | `node-driver-registrar` | 注册 CSI Node 驱动到 kubelet |
 | `livenessprobe` | 检测 CSI 驱动健康状态 |
 
-**CSI 卷生命周期**：
+**CSI 卷生命周期（概念顺序；实际由多个控制器和 Sidecar 异步协调）**：
 
 ```
 用户创建 PVC → external-provisioner 检测到 PVC
-  → 调用 CSI Controller.CreateVolume() → 云 API 创建云盘 → 返回 VolumeID
-  → PV 创建(含 VolumeHandle=VolumeID) → PV 绑定 PVC
+  → 调用 CSI Controller.CreateVolume() → 云 API 创建卷 → 返回 VolumeID
+  → PV 创建（含 VolumeHandle=VolumeID）→ PV 绑定 PVC
 
-Pod 调度到节点 → external-attacher 检测到 VolumeAttachment
-  → 调用 CSI Controller.ControllerPublishVolume() → 云 API 挂载云盘到节点
-  → kubelet 调用 CSI Node.NodeStageVolume() → 格式化/挂载全局路径
-  → kubelet 调用 CSI Node.NodePublishVolume() → bind mount 到 Pod 目录
+Pod 调度 → attach/detach controller 创建 VolumeAttachment
+  → external-attacher 观察 VolumeAttachment
+  → 调用 ControllerPublishVolume() → 云 API 将卷挂载到节点
+  → kubelet 调用 NodeStageVolume()（若驱动支持 STAGE_UNSTAGE_VOLUME）
+  → kubelet 调用 NodePublishVolume() → 挂载到 Pod 目录
 
-Pod 删除 → NodeUnpublishVolume() → 卸载 Pod 目录
-  → ControllerUnpublishVolume() → 云 API 卸载云盘
-  → PVC 删除 → DeleteVolume() → 云 API 删除云盘
+Pod 删除 → NodeUnpublishVolume()
+  → 必要时 NodeUnstageVolume()
+  → external-attacher 根据 VolumeAttachment 调用 ControllerUnpublishVolume()
+PVC 删除后按 PV reclaim policy 处理：
+  → Delete：external-provisioner 通常调用 DeleteVolume() 删除后端卷
+  → Retain：保留 PV/后端数据，等待管理员处理
 ```
 
-**CSI 迁移（CSI Migration）**：K8s 1.23+ 将内置的 in-tree 存储插件（如 `kubernetes.io/aws-ebs`）逐步迁移为 CSI 驱动。迁移后 in-tree provisioner 名称仍可用，但底层自动路由到 CSI 驱动。
+**CSI 迁移（CSI Migration）**：支持状态、默认开关和 in-tree 插件移除时间因存储插件与 Kubernetes 版本而异，并且需要预先安装对应 CSI 驱动。新集群应直接使用 CSI StorageClass，不要假定旧 provisioner 名称在所有版本中仍能自动迁移。
+
+CSI Inline Ephemeral Volume 的生命周期与 Pod 绑定，但只有驱动在 `CSIDriver.spec.volumeLifecycleModes` 中声明 `Ephemeral` 后才能使用。不能仅凭 CSI 驱动名称假定支持。
 
 ```yaml
-# CSI Ephemeral Volume（Pod 生命周期内临时卷）
+# 语义示例：请将 driver 替换为明确声明 Ephemeral 能力的驱动
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: example.csi.io
+spec:
+  volumeLifecycleModes:
+    - Ephemeral
+---
 apiVersion: v1
 kind: Pod
+metadata:
+  name: inline-csi-demo
 spec:
   containers:
     - name: app
+      image: busybox
+      command: ["sh", "-c", "sleep 3600"]
       volumeMounts:
         - name: scratch
           mountPath: /scratch
   volumes:
     - name: scratch
       csi:
-        driver: com.tencent.cloud.csi.cbs
+        driver: example.csi.io
         volumeAttributes:
-          type: CLOUD_SSD
+          type: scratch
 ```
 
 ### 3 负载均衡
@@ -5017,12 +5079,13 @@ $ kubectl get svc nginx-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
 
 ```shell
 $ helm repo add external-dns https://kubernetes-sigs.github.io/external-dns/
-$ helm install external-dns external-dns/external-dns \
+# Provider 名称和鉴权方式随 external-dns 版本/腾讯云集成变化，先核对当前 Chart 文档。
+# 不要通过 --set 传 AK/SK；使用 Workload Identity/CAM 角色，或引用预先创建的 Secret。
+$ helm upgrade --install external-dns external-dns/external-dns \
     --namespace kube-system \
-    --set provider=tencentcloud \
-    --set tencentcloud.secretId=<YOUR_SECRET_ID> \
-    --set tencentcloud.secretKey=<YOUR_SECRET_KEY> \
-    --set policy=sync
+    --set provider.name=<verified-provider> \
+    --set policy=upsert-only \
+    --set txtOwnerId=<cluster-id>
 ```
 
 #### 4.2 使用
@@ -5132,7 +5195,7 @@ env:
         key: DB_PASSWORD
 ```
 
-> **安全收益**：Secret 原文只存在于云密钥管理服务中，Git 中零暴露。
+> **安全边界**：密钥不再以明文进入 Git，云密钥服务作为源；但 `target` 生成的 Kubernetes Secret 仍存储在 API Server/etcd 并投射给 Pod。仍需启用 etcd 静态加密、最小 RBAC、审计和 Secret 读取权限隔离。
 
 ### 6 生产建议
 
@@ -5178,9 +5241,9 @@ Sidecar（边车）是一种容器设计模式：在主应用容器旁运行一�
 | **Network** | 始终共享（同一 Pod 内 localhost 可达） | 不可关闭 |
 | **Storage** | 通过 `volumes` + `volumeMounts` 显式共享 | 按需声明 |
 | **PID** | **默认不共享** | `spec.shareProcessNamespace: true` |
-| **IPC** | 默认共享 | `spec.hostIPC: false` 可关闭 |
+| **IPC** | 同一 Pod 容器通常共享 Pod IPC Namespace；`hostIPC: true` 会改为共享宿主机 IPC | `spec.hostIPC` |
 
-> **PID 共享的作用**：Sidecar 需要查看主容器进程（如 Promtail 监控主容器的日志文件位置、APM agent 采集进程指标）时，必须设置 `shareProcessNamespace: true`，否则 Sidecar 看不到主容器进程。
+> **PID 共享的作用**：只有 Sidecar 必须读取或向主容器进程发信号时才需要 `shareProcessNamespace: true`。Promtail 读取共享 Volume 中的日志文件通常不需要查看主进程 PID。
 
 ```yaml
 # 需要 PID 共享的场景
@@ -5253,6 +5316,9 @@ kind: Pod
 metadata:
   name: nginx-auto-reload
 spec:
+  # 示例通过共享 PID namespace 让 Sidecar 调用主容器中的 nginx 进程；
+  # 更解耦的生产方案是由应用暴露受保护的 reload HTTP/Admin Socket。
+  shareProcessNamespace: true
   containers:
     # 主容器 — Nginx
     - name: nginx
@@ -5260,6 +5326,8 @@ spec:
       volumeMounts:
         - name: nginx-config
           mountPath: /etc/nginx/conf.d
+        - name: nginx-pid
+          mountPath: /var/run
     # Sidecar — 监听配置变化并调用 nginx -s reload
     - name: config-reloader
       image: nginx:1.23
@@ -5285,11 +5353,11 @@ spec:
       emptyDir: {}
 ```
 
-> **注意**：Kubernetes 1.21+ 支持 `immutable` ConfigMap，但更新 ConfigMap 后 symlink 方式挂载的文件默认不更新（需配合 `configmap-reloader` 工具）。
+> **注意**：非 `subPath`、非 immutable 的 ConfigMap 投射卷会由 kubelet 周期性更新（采用原子目录与符号链接切换）；环境变量和 `subPath` 挂载不会自动更新。文件更新也不等于应用自动 reload，因此仍可能需要 reloader 或应用自身 watch 机制。
 
-### 5 Sidecar 容器（Kubernetes 1.28+ 原生支持）
+### 5 原生 Sidecar 容器（版本相关）
 
-从 Kubernetes 1.28 开始（`SidecarContainers` feature gate 默认启用），原生支持 Sidecar 容器。Sidecar 容器在 Init Containers 基础上增加了 `restartPolicy: Always`，保证其与主容器同生命周期：
+原生 Sidecar 通过 `initContainers[*].restartPolicy: Always` 表达。该能力在 Kubernetes 1.28 为 Alpha，1.29 进入 Beta 并默认启用，后续版本继续演进；使用前必须核对目标集群版本和 `SidecarContainers` Feature Gate，不能笼统写成“1.28 默认启用”。
 
 ```yaml
 apiVersion: v1
@@ -5321,12 +5389,12 @@ spec:
 
 **原生 Sidecar 的优势**：
 
-| 特性 | 传统 Sidecar | 原生 Sidecar (1.28+) |
-|------|-------------|----------------------|
-| 启动顺序 | 与主容器并发 | InitContainers 跑完 → Sidecar → 主容器 |
-| 关闭顺序 | 并发 | 先停主容器 → 等待 terminationGracePeriod → 再停 Sidecar |
-| 探针支持 | 全支持 | 全支持 |
-| Job 支持 | 不支持 | 支持（主容器结束后 Sidecar 自动退出） |
+| 特性 | 普通 containers 中的 Sidecar | 原生 restartable init Sidecar |
+|------|-----------------------------|------------------------------|
+| 启动顺序 | 与其他应用容器近似并发 | 按 initContainers 顺序启动；被判定 started 后才进入下一 init，普通 init 完成后启动应用容器 |
+| 关闭顺序 | 与应用容器按常规 Pod 终止流程处理 | 应用容器先终止，再按反向声明顺序终止 Sidecar；共享同一 Pod grace period |
+| 探针支持 | 支持 | 支持 startup/readiness/liveness probe |
+| Job 支持 | 可运行但常驻 Sidecar 会阻止 Pod/Job 自然完成 | 主容器完成后 kubelet 可终止 Sidecar，适合 Job |
 
 ---
 
@@ -5387,11 +5455,11 @@ spec:
 
 | 插件 | 性能 | NetworkPolicy | eBPF | 加密 | 适用场景 |
 |------|------|:---:|:---:|:---:|----------|
-| **Flannel** | 中 | ❌ | ❌ | ❌ | 学习/开发环境 |
-| **Calico** | 高 | ✅ | ✅ | ✅ (WireGuard) | 通用生产环境首选 |
-| **Cilium** | 极高 | ✅ | ✅ (深度) | ✅ | 大规模 + 可观测性需求 |
-| **Weave** | 中 | ✅ | ❌ | ✅ | 中小规模，简单场景 |
-| **Kube-OVN** | 高 | ✅ | ✅ | ✅ | OpenStack/虚拟化环境 |
+| **Flannel** | 需实测 | 通常需配合其他策略实现 | ❌ | 依后端/扩展 | 简单 Overlay/host-gw 场景 |
+| **Calico** | 需实测 | ✅ | 可选 eBPF 数据平面 | 可选 WireGuard | BGP/Overlay 与网络策略场景 |
+| **Cilium** | 需实测 | ✅ | ✅ | 可选 WireGuard/IPsec | eBPF Service、策略与可观测性场景 |
+| **Weave Net** | 需实测 | ✅ | ❌ | 依版本能力 | 采用前评估项目维护状态与版本兼容性 |
+| **Kube-OVN** | 需实测 | ✅ | ❌（主要为 OVN/OVS） | 依部署能力 | 需要子网/VPC 与 OVN/OVS 能力的环境 |
 
 #### 2.1 Calico 安装
 
@@ -5482,7 +5550,7 @@ CNI（Container Network Interface）定义了容器运行时应如何配置网�
 
 ```json
 {
-  "cniVersion": "0.3.1",
+  "cniVersion": "1.0.0",
   "name": "prod-network",
   "plugins": [
     {
@@ -5527,15 +5595,12 @@ $ ls /etc/cni/net.d/
 # 2. 查看 kubelet CNI 相关日志
 $ journalctl -u kubelet | grep -i cni
 
-# 3. 从节点上手动测试 CNI 插件
-$ export CNI_COMMAND=ADD
-$ export CNI_CONTAINERID=$(docker ps -q | head -1)
-$ export CNI_NETNS=/proc/$(docker inspect -f '{{.State.Pid}}' $CNI_CONTAINERID)/ns/net
-$ export CNI_IFNAME=eth0
-$ export CNI_PATH=/opt/cni/bin
-$ cat /etc/cni/net.d/10-calico.conflist | /opt/cni/bin/calico
+# 3. 不要对现有容器手工执行 CNI_COMMAND=ADD；这可能重复分配 IP 或破坏网络。
+# 检查 kubelet、CNI DaemonSet 日志与 IPAM 状态：
+$ journalctl -u kubelet | grep -i cni
+$ kubectl logs -n calico-system -l k8s-app=calico-node --tail=200
 
-# 4. 检查 CNI IPAM 分配情况
+# 4. 检查 Calico IPAM 分配情况（仅适用于 Calico）
 $ kubectl get ippools.crd.projectcalico.org -A
 $ kubectl get ipamblocks.crd.projectcalico.org -A
 ```
@@ -5543,11 +5608,15 @@ $ kubectl get ipamblocks.crd.projectcalico.org -A
 **生产 CNI 选型建议**：
 
 ```
-□ 小规模（<50 节点）：Calico vxlan 模式，部署简单
-□ 中大规模（50~500 节点）：Calico BGP 模式，无 Overlay 开销
-□ 大规模（>500 节点）+ 网络可观测性需求：Cilium eBPF
-□ 游戏/低延迟场景：VPC-CNI（云原生 ENI 直通）+ Cilium
-□ 自建机房：Calico BGP + MetalLB
+不要仅按节点数选 CNI。应联合评估：
+□ 云/裸金属网络与路由控制能力：VPC 路由、BGP、Overlay、ENI
+□ 地址容量、Dual Stack、MTU 与跨可用区路径
+□ NetworkPolicy/L7 策略、加密与多租户隔离需求
+□ kube-proxy replacement、可观测性和故障排查能力
+□ 内核版本、硬件卸载、团队运维经验及升级成本
+□ 压测结果：吞吐、P99 延迟、CPU、连接规模与故障收敛时间
+
+典型方向：云上可评估 VPC/ENI CNI；自建机房可评估 Calico BGP；需要 eBPF 服务转发与可观测性时评估 Cilium。最终以环境验证为准。
 ```
 
 #### 2.5 Pod 间网络通信底层原理（面试深度）
@@ -5562,10 +5631,12 @@ $ kubectl get ipamblocks.crd.projectcalico.org -A
 2. 同一节点上的 Pod 可以直接通信（通过 Pod IP + CNI 网桥）
 3. 跨节点的 Pod 可以直接通信（通过 Pod IP，依赖 CNI 插件做路由/隧道）
 
-实现这三点是 CNI 插件的责任，K8s 本身只管分配 IP。
+Kubernetes 定义 Pod 网络模型，并由 kubelet/CRI 触发网络配置；Pod IP 的分配、接口、路由、隧道和策略通常由 CNI 及其 IPAM 插件实现。
 ```
 
-##### 二、同节点 Pod 通信：veth pair + cni0 bridge
+##### 二、同节点 Pod 通信示例：Bridge CNI 的 veth pair + cni0
+
+> 以下是 Flannel bridge 等实现的示意，不是 Kubernetes 或所有 CNI 的统一数据路径。Calico routed veth、Cilium eBPF、VPC/ENI CNI 可能不创建 `cni0`，也不按同网段 ARP 转发。
 
 ```
 
@@ -5620,10 +5691,10 @@ $ ip link show | grep "^3:"
 **cni0 bridge（Linux Bridge 虚拟交换机）**：
 
 ```
-cni0 是 CNI 插件在每个节点上创建的 Linux Bridge：
-  - 同节点所有 Pod 的 veth 对端都插在 cni0 上
+在采用 Bridge 模式的 CNI 中，`cni0` 是节点上的 Linux Bridge：
+  - 由该 CNI 管理的 Pod veth 对端可接入 `cni0`
   - 工作在二层（MAC 地址学习 + 转发）
-  - 类似一个透明的二层交换机
+  - 其他 CNI 可能采用主机路由、eBPF、OVS/OVN 或 ENI，不存在此网桥
 
 Pod A → Pod B（同节点）完整过程：
 
@@ -5685,8 +5756,8 @@ Step 3: 物理网络按 192.168.2.1 转发到 Node2
 Step 4: Node2 收到 → 查路由表 → 10.0.2.0/24 dev cni0
   → 从 cni0 → veth → Pod B
 
-全程 Pod IP 没被改过（无 NAT、无封装），性能最优（~1% 损耗）。
-要求：物理网络能路由 Pod IP。云上 VPC 通常不认识 Pod IP → 不适用。
+全程 Pod IP 不变（无 Overlay 封装）；性能仍取决于路由规模、NIC、MTU、策略链路与硬件环境，不能套固定损耗比例。
+要求：底层网络能路由 Pod CIDR 或节点间路由；云上是否可用取决于 VPC 路由能力、配额和云厂商网络方案。
 ```
 
 **方案 B — Overlay 封包模式（Flannel VXLAN / Calico IPIP）**：
@@ -5715,42 +5786,35 @@ Step 4: 封装后的包从 Node1 物理网卡发出 → 物理网络正常转发
 Step 5: Node2 收到 UDP 端口 8472 → 内核 VXLAN 模块解封装 → 露出原始包
 Step 6: Node2 路由原始包 → cni0 → Pod B
 
-IPIP 模式（Calico 的另一选择，比 VXLAN 轻量）：
+IPIP 模式（Calico 的一种封装选择）：
   ┌──────────────────┬────────────────────┐
   │ 外层 IP 头        │ 原始 IP 包（完整）  │  ← 只多一层 IP 头，无 UDP/VXLAN
   └──────────────────┴────────────────────┘
-  协议号 4，损耗约 3-5%（vs VXLAN 的 5-10%）
+  协议号 4；与 VXLAN 的实际性能差异必须在相同 MTU、策略、内核、NIC 和负载下压测，不能使用固定百分比概括
 ```
 
 **方案 C — eBPF 直通（Cilium）**：
 
 ```
-核心思想：用 eBPF 程序绕开内核协议栈，在网卡驱动层直接转发
+核心思想：在 TC/XDP、cgroup socket 等内核 Hook 上运行 eBPF 程序，通过 Map 实现路由、策略与 Service 转发；具体路径取决于 Cilium 配置。
 
-传统路径（iptables/kube-proxy）：
-  Pod A → veth → cni0 → host 协议栈（iptables 逐条匹配规则 O(n)）
-  → 路由决策 → 物理网卡 → 网络 → Node2 → 反过来再走一遍
+传统 iptables/kube-proxy 与 Cilium eBPF 的差异：
+  - Cilium 在启用 kube-proxy replacement 时可绕过 kube-proxy iptables/IPVS Service 规则
+  - 某些 datapath 模式可绕过 Linux Bridge，但是否使用 veth、host routing 或 XDP 取决于配置
+  - Cilium 仍有自己的 eBPF conntrack/NAT Map，不能说“完全不做连接跟踪”
+  - eBPF 查表不等于整个网络链路严格 O(1)，策略数量、Map、封装、加密和硬件都会影响性能
 
-Cilium eBPF 路径：
-  Pod A → veth → eBPF 直接查 Map（O(1) 查表）
-  → "目标 10.0.2.20 → 下一跳是 Node2 → 直发物理网卡"
-  
-  跳过了：
-    ✗ cni0 bridge（不需要二层桥）
-    ✗ iptables（不需要逐条 O(n) 匹配）
-    ✗ conntrack（不需要连接跟踪）
-
-性能：转发延迟约 50μs（vs iptables 约 500μs）
+性能必须在目标内核、NIC、MTU、策略、连接规模和负载下基准测试，不使用固定微秒值。
 ```
 
 **三种方案性能对比**：
 
 | 方案 | 原理 | 性能损耗 | 适用场景 |
 |------|------|----------|----------|
-| 路由 (Calico BGP) | IP 路由，无封装 | ~1% | 自建机房，物理网络可路由 Pod IP |
-| IPIP (Calico) | IP-in-IP 隧道 | ~3-5% | 云上 VPC，不需要 BGP |
-| VXLAN (Flannel) | L2 over UDP 隧道 | ~5-10% | 云上 VPC，需要 L2 连通性 |
-| eBPF (Cilium) | 内核旁路直接转发 | ~0% | 内核 ≥ 5.4，高性能场景 |
+| 路由（Calico BGP） | IP 路由，无 Overlay 封装 | 取决于路由/策略/NIC | 可控制底层路由的环境 |
+| IPIP（Calico） | IP-in-IP 隧道 | 需实测封装、MTU 与 CPU 开销 | 底层不能直接路由 Pod CIDR 的场景 |
+| VXLAN（Flannel/Calico） | L2 over UDP 隧道 | 需实测封装、MTU 与 CPU 开销 | 通用 Overlay 场景 |
+| eBPF（Cilium） | eBPF Map 承载路由、策略与 Service 转发 | 依内核、模式、策略、加密和硬件 | 需要 kube-proxy replacement、策略与可观测性的场景 |
 
 ##### 四、NAT 在 Pod 网络中的位置
 
@@ -5788,14 +5852,15 @@ Calico 中的 BGP：节点互相告知"我的 Pod 网段走我这个 IP"
 问："两个 Pod 之间网络怎么通的？"
 
 答：
-同节点 → veth pair 连接 Pod NS 和宿主机 cni0 bridge，二层 MAC 转发。
+先确认 CNI 和 datapath，不能把所有集群都概括为 `cni0`。同节点通常由 veth/ENI 等把 Pod 网络接入主机，再由 Bridge、主机路由、OVS/OVN 或 eBPF 转发。
 
-跨节点 → 取决于 CNI：
-  - Calico BGP：节点 BGP 宣告 Pod 网段，裸 IP 路由，不封包，性能最好
-  - Flannel VXLAN：Pod IP 包封装进 Node IP 的 UDP，物理网络只看到 Node IP
-  - Cilium eBPF：网卡驱动层直接转发，旁路内核，延迟最低
+跨节点取决于 CNI 与底层网络：
+  - Calico BGP：宣告 Pod 路由，可采用无 Overlay 路由
+  - Flannel/Calico VXLAN：把 Pod 包封装在节点间 UDP/VXLAN 隧道中
+  - Cilium：通过 eBPF Map 实现路由、策略及可选的 kube-proxy replacement，具体路径取决于配置
+  - VPC/ENI CNI：Pod 可能直接获得云网络接口或可路由地址
 
-K8s 只定义"每个 Pod 独立 IP"，具体怎么通是 CNI 插件的责任。
+Kubernetes 定义 Pod 网络模型；具体 IPAM、接口与数据路径由 CNI、云网络及底层路由共同实现。
 ```
 
 ### 3 服务网格（Service Mesh）概述
@@ -5833,12 +5898,13 @@ Service Mesh 将网络通信能力下沉到 Sidecar 代理层，应用无需感�
 #### 3.2 Istio 安装
 
 ```shell
-# 下载 Istio
-$ curl -L https://istio.io/downloadIstio | sh -
-$ cd istio-1.20.0
-$ export PATH=$PWD/bin:$PATH
+# 下载经验证且仍受支持的 Istio 版本
+$ export ISTIO_VERSION=<version>
+$ curl -L https://istio.io/downloadIstio | ISTIO_VERSION="$ISTIO_VERSION" sh -
+$ cd "istio-${ISTIO_VERSION}"
+$ export PATH="$PWD/bin:$PATH"
 
-# 安装（默认配置）
+# 安装（示例配置，生产应先审查 manifest）
 $ istioctl install --set profile=default -y
 
 # 启用 Sidecar 自动注入
@@ -5906,216 +5972,50 @@ spec:
             paths: ["/api/*"]
 ```
 
-#### 3.5 Istio Operator 生产级安装
+#### 3.5 Istio 生产安装与升级（当前推荐路线）
 
-`istioctl install` 适合开发和调试，生产环境推荐使用 **IstioOperator CR** 声明式管理 Istio 安装。Istio Operator 是 K8s Operator 模式的具体应用，通过 CR 描述 Istio 集群的期望状态。
+集群内 Istio Operator 及 `istioctl operator init` 路线已经弃用/移除，不应再作为生产推荐。当前通常使用以下方式：
 
-```
-┌──────────────────────────────────────────────────────────┐
-│              Istio Operator 架构                          │
-│                                                          │
-│  kubectl apply -f istio-operator.yaml                    │
-│        │                                                 │
-│        ▼                                                 │
-│  ┌──────────────────────┐                               │
-│  │ IstioOperator CR     │  ← 用户定义期望状态             │
-│  │ (spec.profile/components) │                           │
-│  └──────────┬───────────┘                               │
-│             │ watch                                       │
-│             ▼                                             │
-│  ┌──────────────────────┐                               │
-│  │ Istio Operator       │  ← 控制循环（Controller）       │
-│  │ (Deployment)         │     调谐：实际 → 期望           │
-│  └──────────┬───────────┘                               │
-│             │ 创建/更新                                   │
-│             ▼                                             │
-│  ┌──────────────────────────────────────┐               │
-│  │ Istiod (Control Plane)               │               │
-│  │ Discovery + CA + xDS Server          │               │
-│  │ ┌──────────┐ ┌──────────┐           │               │
-│  │ │Pilot     │ │Citadel   │ ...       │               │
-│  │ └──────────┘ └──────────┘           │               │
-│  └──────────────────────────────────────┘               │
-└──────────────────────────────────────────────────────────┘
-```
-
-**步骤 1：安装 Istio Operator**
+1. **Helm**：适合 GitOps 和分层管理 `base`、`istiod`、gateway。
+2. **`istioctl install -f`**：适合显式配置文件驱动的安装与升级。
+3. **Revision + Canary Upgrade**：新旧控制平面并存，按命名空间逐步迁移数据面。
 
 ```shell
-# 使用 istioctl 安装 Operator（仅一次）
-$ istioctl operator init
-# 或通过 Helm:
-$ helm install istio-operator manifests/charts/istio-operator
+# 方式一：Helm。生产中必须锁定并验证 chart 版本
+helm repo add istio https://istio-release.storage.googleapis.com/charts
+helm repo update
+helm upgrade --install istio-base istio/base -n istio-system --create-namespace --version <version>
+helm upgrade --install istiod istio/istiod -n istio-system --version <version> -f values.yaml --wait
+
+# 方式二：使用配置文件；先生成/审查清单，再安装
+istioctl manifest generate -f istio-config.yaml > rendered-istio.yaml
+istioctl analyze -f rendered-istio.yaml
+istioctl install -f istio-config.yaml --revision 1-xx --skip-confirmation
 ```
 
-**步骤 2：编写 IstioOperator CR**
-
-```yaml
-apiVersion: install.istio.io/v1alpha1
-kind: IstioOperator
-metadata:
-  name: production-istio
-  namespace: istio-system
-spec:
-  # 基础配置 Profile：default / demo / minimal / empty
-  profile: default
-
-  # 全局配置
-  meshConfig:
-    accessLogFile: /dev/stdout
-    accessLogEncoding: JSON
-    enableTracing: true
-    # 可观测性后端
-    defaultProviders:
-      metrics:
-        - prometheus
-    # 信任域
-    trustDomain: prod.internal
-
-  # 组件配置（按需调整副本和资源）
-  components:
-    pilot:
-      k8s:
-        replicas: 2
-        hpaSpec:
-          minReplicas: 2
-          maxReplicas: 10
-          metrics:
-            - type: Resource
-              resource:
-                name: cpu
-                targetAverageUtilization: 80
-        resources:
-          requests:
-            cpu: 500m
-            memory: 2Gi
-          limits:
-            cpu: 2
-            memory: 4Gi
-        # Pod 反亲和：分散到不同节点
-        affinity:
-          podAntiAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              - labelSelector:
-                  matchLabels:
-                    istio: pilot
-                topologyKey: kubernetes.io/hostname
-
-    # Ingress Gateway
-    ingressGateways:
-      - name: istio-ingressgateway
-        enabled: true
-        k8s:
-          replicas: 2
-          service:
-            type: LoadBalancer
-            ports:
-              - port: 80
-                targetPort: 8080
-                name: http2
-              - port: 443
-                targetPort: 8443
-                name: https
-              - port: 15443
-                targetPort: 15443
-                name: tls
-          # HPA 自动伸缩
-          hpaSpec:
-            minReplicas: 2
-            maxReplicas: 5
-            metrics:
-              - type: Resource
-                resource:
-                  name: cpu
-                  targetAverageUtilization: 80
-
-    # Egress Gateway（出站流量管控）
-    egressGateways:
-      - name: istio-egressgateway
-        enabled: true
-        k8s:
-          replicas: 1
-
-  # Sidecar 注入配置
-  values:
-    sidecarInjectorWebhook:
-      enableNamespacesByDefault: false   # 默认不注入，按 namespace 标签控制
-    global:
-      proxy:
-        resources:
-          requests:
-            cpu: 100m
-            memory: 128Mi
-          limits:
-            cpu: 2
-            memory: 512Mi
-        # 日志级别
-        logLevel: warning
-        # 接入日志
-        accessLogFile: /dev/stdout
-        accessLogEncoding: JSON
-```
-
-**步骤 3：应用 IstioOperator**
+**金丝雀升级**：
 
 ```shell
-# 预览变更（dry-run）
-$ istioctl analyze --operator-file istio-operator.yaml
+# 安装新 revision，与旧控制平面并存
+istioctl install -f istio-config.yaml --revision 1-xx --skip-confirmation
 
-# 应用配置
-$ kubectl apply -f istio-operator.yaml
+# 将测试命名空间迁移到新 revision；移除旧的 istio-injection 标签，避免冲突
+kubectl label namespace game-preview istio-injection- --overwrite
+kubectl label namespace game-preview istio.io/rev=1-xx --overwrite
+kubectl rollout restart deployment -n game-preview
 
-# 查看 Operator 状态
-$ kubectl get istiooperator -n istio-system
-$ istioctl version
-$ istioctl proxy-status                    # 查看所有 Sidecar 状态
+# 验证代理连接和流量后再逐步迁移其他命名空间
+istioctl proxy-status
+istioctl analyze --all-namespaces
 ```
 
-**IstioOperator vs istioctl install 对比**：
-
-| 特性 | `istioctl install` | IstioOperator CR |
-|------|-------------------|-------------------|
-| 声明式 | ❌（命令行传参） | ✅（YAML CR） |
-| GitOps 友好 | ❌（脚本化） | ✅（CR 可直接入 Git） |
-| 自动调谐 | ❌（手动更新） | ✅（Operator 持续调谐） |
-| 增量变更 | 需要完整重装 | 修改 CR 即可 |
-| 回滚 | 手动卸载重装 | 修改 CR 或 Git revert |
-| 多版本共存 | ❌ | ✅（canary upgrade） |
-
-**金丝雀升级（Canary Upgrade）**：
-
-```yaml
-apiVersion: install.istio.io/v1alpha1
-kind: IstioOperator
-metadata:
-  name: canary-1-21
-  namespace: istio-system
-spec:
-  revision: 1-21                 # 版本标签
-  profile: default
-  components:
-    pilot:
-      k8s:
-        env:
-          - name: PILOT_SCOPE_NAMESPACES
-            value: "game-preview"    # 仅影响指定命名空间
-```
-
-```shell
-# 部署新版本（不影响现有流量）
-$ kubectl apply -f canary-1-21.yaml
-
-# 将测试 namespace 切换到新版本
-$ kubectl label namespace game-preview istio.io/rev=1-21
-
-# 验证后全量迁移 → 删除旧版本 IstioOperator CR
-```
+> 安装 API、Chart values 和升级步骤随 Istio 版本变化。二次学习时应记录 Istio/Helm Chart/Kubernetes 的版本矩阵，并优先查阅对应版本官方文档。
 
 ### 4 多集群网络
 
 | 方案 | 说明 | 适用场景 |
 |------|------|----------|
-| **KubeFed v2** | 官方联邦方案，跨集群同步资源 | 多区域部署 |
+| **KubeFed** | 社区联邦控制面方案（生态活跃度与版本兼容性需单独评估） | 已明确接受其运维成本的资源同步场景 |
 | **Istio Multi-Cluster** | Service Mesh 层跨集群通信 | 已有 Istio |
 | **Cilium Cluster Mesh** | CNI 层跨集群 Pod 直通 | 低延迟需求 |
 | **Submariner** | 跨集群网络直连 | CNI 无关，简单部署 |
@@ -6194,7 +6094,7 @@ $ kubectl run iperf-client --image=networkstatic/iperf3 --rm -it --restart=Never
 传统方式需要在 Prometheus 配置文件 `scrape_configs` 中手动写采集目标：
 
 ```yaml
-# ❌ 传统方式：每次新增服务都要改 Prometheus 配置，重启 Prometheus
+# 传统静态方式：新增目标需要修改集中式 scrape_configs，并通过 POST /-/reload、SIGHUP 或 config-reloader 重载；通常无需重启进程
 scrape_configs:
   - job_name: 'my-app'
     static_configs:
@@ -6219,21 +6119,16 @@ spec:
 ```
 
 ```
-┌──────────────────────────────────────────────────────┐
-│              Prometheus Operator                      │
-│                                                      │
-│  ┌──────────────┐    watch     ┌────────────────┐   │
-│  │  Prometheus  │◄────────────│ ServiceMonitor  │   │
-│  │   CR 实例     │             │ / PodMonitor    │   │
-│  └──────┬───────┘             │ / Probe CRD    │   │
-│         │ 自动更新配置         └───────┬────────┘   │
-│         ▼                             │ 管理者       │
-│  ┌──────────────┐              ┌──────▼─────────┐  │
-│  │  Prometheus  │── scrape ──▶│     Pods        │  │
-│  │    Pod       │              └────────────────┘  │
-│  └──────────────┘                                   │
-└──────────────────────────────────────────────────────┘
+Prometheus Operator
+  ├── watch Prometheus CR / ServiceMonitor / PodMonitor / Probe
+  ├── 生成 Prometheus 配置并由 config-reloader 触发 reload
+  └── 管理 Prometheus StatefulSet/Pod
+
+Prometheus Pod
+  └── 根据生成的服务发现与抓取配置 scrape Targets
 ```
+
+> CR 只是 API 数据对象，不会主动 watch 其他资源；执行 watch 和生成配置的是 Prometheus Operator。
 
 ### 2 Prometheus Operator CRD 全景与选择器匹配机制
 
@@ -6250,19 +6145,25 @@ spec:
   serviceMonitorSelector:
     matchLabels:
       release: prometheus      # ← 只有带此 label 的 ServiceMonitor 才会被选中
+  serviceMonitorNamespaceSelector:
+    matchNames: [app-ns]       # ← 跨命名空间选择；{} 表示允许所有命名空间
   podMonitorSelector:           # PodMonitor 同理
     matchLabels:
       release: prometheus
+  podMonitorNamespaceSelector:
+    matchNames: [app-ns]
 ```
 
 ```
-Prometheus CR.serviceMonitorSelector.matchLabels
+Prometheus CR 的 serviceMonitorSelector + serviceMonitorNamespaceSelector
           ↓ 匹配
-ServiceMonitor.metadata.labels    ← 必须包含 "release: prometheus"
+ServiceMonitor.metadata.labels / namespace
+          ↓ 选择
+Service.metadata.labels
           ↓ 发现
-Service.selector                  ← 找到 Service 对应的 Pod
+EndpointSlice/Endpoints 的地址与端口
           ↓ scrape
-Pod IP:port
+Target address:port
 ```
 
 > **最常见故障**：ServiceMonitor 配置正确但 Target 不出现 → 检查 ServiceMonitor 的 labels 是否匹配 Prometheus CR 的 `serviceMonitorSelector`。
@@ -6271,10 +6172,10 @@ Pod IP:port
 
 | 步骤 | 说明 |
 |------|------|
-| 1. Prometheus CR → ServiceMonitor | 通过 `serviceMonitorSelector` label 匹配 |
-| 2. ServiceMonitor → Service | 通过 `spec.selector` label 匹配 |
-| 3. Service → Pod | 通过 `spec.selector` label 匹配 |
-| 4. Prometheus → Pod | 使用 Pod IP + containerPort 直连采集 |
+| 1. Prometheus CR → ServiceMonitor | 通过 `serviceMonitorSelector` 和 `serviceMonitorNamespaceSelector` 匹配 |
+| 2. ServiceMonitor → Service | 通过 `spec.selector` 匹配 Service label |
+| 3. Service → EndpointSlice/Endpoints | 普通 selector-backed Service 通常由 Controller 根据 Pod 状态维护，也可使用手工 EndpointSlice |
+| 4. Prometheus → Target | 使用 EndpointSlice/Endpoints 中已解析的地址与端口采集，不限定必须是 Pod IP |
 
 **CRD 全景表格**：
 
@@ -6313,18 +6214,14 @@ spec:
 ```
 ServiceMonitor.selector.matchLabels
         ↓ 匹配
-Service.metadata.labels
-        ↓ 关联
-Service.spec.selector
-        ↓ 匹配
-Pod.metadata.labels
-        ↓ 获取
-Pod.Status.PodIP + Service.spec.ports[].targetPort
+Service.metadata.labels + Service 端口名称
+        ↓ 发现
+EndpointSlice/Endpoints 的地址、端口与就绪条件
         ↓
-Prometheus 向 PodIP:targetPort 发起 scrape
+Prometheus 向生成的 Target address:port 发起 scrape
 ```
 
-> **关键**：Prometheus 直接采集 **Pod IP**，不经过 Service 虚拟 IP。Service 只用于服务发现。
+> **关键**：ServiceMonitor 通常不通过 Service ClusterIP 抓取，而是依据 EndpointSlice/Endpoints 生成 Target。普通 Service 常得到 Pod IP，但 selectorless Service 可以指向非 Pod 地址。
 
 #### 3.3 全部字段
 
@@ -6364,7 +6261,7 @@ spec:
 
   # === 端点配置 ===
   endpoints:
-    - port: metrics                       # Service port name（推荐）或 port number
+    - port: metrics                       # Service 的端口名称；按当前 CRD 校验字段语义，不写裸端口号
       interval: 30s                       # 采集间隔
       scrapeTimeout: 10s                  # 单次采集超时
       path: /metrics                      # 指标路径
@@ -6411,27 +6308,27 @@ spec:
         - action: drop                     # 丢弃匹配的 target
           sourceLabels: [__meta_kubernetes_pod_label_canary]
           regex: "true"
-        - action: labelmap                 # 自动将匹配的 label 前缀映射
-          regex: __meta_kubernetes_pod_label_(.+)  # 所有 pod label → 去掉前缀
+        # 谨慎使用 labelmap：把所有 Pod Label 复制为指标标签会导致基数爆炸。
+        # 生产中应逐个映射稳定、低基数的业务标签，而不是使用 (.+) 全量复制。
       # === 指标重标记（拉取后，推荐在此做） ===
       metricRelabelings:
-        - action: drop                     # 丢弃不必要的高基数指标
-          sourceLabels: [__name__]
-          regex: 'http_request_duration_seconds_bucket'
+        # Histogram bucket 是计算 P95/P99 的必要数据，不要为了降基数直接删除；
+        # 若确实不需要分位数，应同时审查配套规则和 Dashboard。
         - action: keep                     # 只保留匹配的指标
           sourceLabels: [__name__]
           regex: 'go_.*|process_.*|http_.*'
         - action: labeldrop                # 删除指定 label
           regex: 'pod_template_hash|pod_uid'
-        - action: labelkeep                # 只保留指定 label
-          regex: 'namespace|pod|container'
+        # 不建议随意使用 labelkeep；它会删除未匹配的 __name__、job、instance、le 等关键标签。
+        # 若必须使用，应按具体指标显式保留所有必要标签。
 
-  # === 采集端点的 target 数量限制 ===
-  sampleLimit: 1000                        # 单次采集最大样本数
-  targetLimit: 50                          # 最大 target 数
-  labelLimit: 30                           # 单个 target 最大 label 数
-  labelNameLengthLimit: 200                # label 名最大长度
-  labelValueLengthLimit: 500               # label 值最大长度
+  # === Monitor 级保护限制 ===
+  # 以下字段属于 ServiceMonitor.spec，而非 endpoints[]；实际可用性以当前 Operator CRD 为准。
+  sampleLimit: 1000                        # 每个 scrape 的样本数上限
+  targetLimit: 50                          # 该 Monitor 接受的 target 数上限
+  labelLimit: 30                           # 单个样本 label 数上限
+  labelNameLengthLimit: 200                # label 名长度上限
+  labelValueLengthLimit: 500               # label 值长度上限
 ```
 
 ### 4 自动发现元标签速查表
@@ -6487,7 +6384,7 @@ spec:
 | 维度 | ServiceMonitor | PodMonitor |
 |------|----------------|------------|
 | 依赖 | Service 必须存在 | 直接选 Pod |
-| 确定性 | 只采集 Ready Pod | 可能采集未就绪 Pod |
+| 就绪端点 | 通常依据 EndpointSlice 条件；`publishNotReadyAddresses`、手工 EndpointSlice 与 Operator 配置可包含未就绪地址 | 是否保留未就绪 Pod 取决于发现元标签和 relabel 配置 |
 | 端口映射 | 通过 Service port name | 直接使用容器 port name |
 | 适用场景 | 常规 HTTP/gRPC 服务 | Sidecar、Headless、NATS |
 
@@ -6517,19 +6414,17 @@ spec:
         - action: keep
           sourceLabels: [__name__]
           regex: 'game_.*|go_.*|process_.*'
-    # 运行时指标（NATS 客户端）
-    - port: metrics
+    # 第二组业务指标：前提是该端点确实暴露 Prometheus/OpenMetrics 文本格式
+    - port: runtime-metrics
       interval: 30s
-      path: /debug/vars
+      path: /metrics
       metricRelabelings:
         - action: keep
           sourceLabels: [__name__]
           regex: 'nats_.*'
-    # gRPC 健康检查
-    - port: grpc-metrics
-      interval: 60s
-      path: /grpc.health.v1.Health/Check
 ```
+
+> ServiceMonitor 只能抓取 Prometheus/OpenMetrics 格式的 HTTP 指标。`/debug/vars` 常见为 JSON，不能直接解析；gRPC Health Check 也不是指标抓取端点，应由 kubelet `grpc` probe 或 blackbox/grpc exporter 检测。若需采集 NATS/其他组件，应部署对应 Exporter 或启用其 Prometheus 指标端点。
 
 ### 7 生产案例二：Sidecar 指标采集
 
@@ -6730,14 +6625,17 @@ metricRelabelings:
 **性能保护参数**：
 
 ```yaml
-endpoints:
-  - port: metrics
-    sampleLimit: 5000             # 单次采集最大 5000 条样本
-    targetLimit: 100              # 单个 Service 最多 100 个 target
-    labelLimit: 50
-    labelValueLengthLimit: 1024
-    bodySizeLimit: 10MB           # 响应体最大 10MB
+spec:
+  sampleLimit: 5000               # 每个 scrape 的样本数上限
+  targetLimit: 100                # 该 Monitor 接受的 target 数上限
+  labelLimit: 50
+  labelValueLengthLimit: 1024
+  bodySizeLimit: 10MB             # 抓取响应体上限；字段支持情况以当前 CRD 为准
+  endpoints:
+    - port: metrics
 ```
+
+> 这些保护字段的层级和可用版本随 Prometheus Operator CRD 演进；应用前先执行 `kubectl explain servicemonitor.spec` 并由 API Server dry-run 校验。
 
 ### 12 完整健康检查链路
 
@@ -6767,10 +6665,13 @@ spec:
       rules:
         - alert: GameServerHighErrorRate
           expr: |
-            sum(rate(http_requests_total{app="gamesvr",status=~"5.."}[5m]))
-            /
-            sum(rate(http_requests_total{app="gamesvr"}[5m]))
-            > 0.05
+            (
+              sum by (namespace) (rate(http_requests_total{app="gamesvr",status=~"5.."}[5m]))
+              /
+              sum by (namespace) (rate(http_requests_total{app="gamesvr"}[5m]))
+            ) > 0.05
+            and on (namespace)
+            sum by (namespace) (rate(http_requests_total{app="gamesvr"}[5m])) > 0
           for: 5m
           labels:
             severity: critical
@@ -6782,8 +6683,11 @@ spec:
 
         - alert: GameServerHighLatency
           expr: |
-            histogram_quantile(0.99,
-              rate(http_request_duration_seconds_bucket{app="gamesvr"}[5m])
+            histogram_quantile(
+              0.99,
+              sum by (namespace, le) (
+                rate(http_request_duration_seconds_bucket{app="gamesvr"}[5m])
+              )
             ) > 2
           for: 10m
           labels:
@@ -6883,42 +6787,32 @@ TKE 提供两种容器网络方案，创建集群时必须选择且不可更改�
 
 #### 2.1 Global Router（全局路由）
 
-```
-Pod 网段独立于 VPC，通过路由表转发
-适用于：节点数 < 200，不要求 Pod 直连 VPC 资源
-```
-
-```shell
-# 创建集群时指定
---network-cidr=172.16.0.0/16      # 集群内 Pod 网段
---cluster-cidr=10.0.0.0/12        # Service 网段
+```text
+Pod 使用独立 CIDR，通过 VPC 路由表或节点路由与 VPC 网络互通。
+只要路由、安全组和相关配额允许，访问 VPC 资源通常不要求 NAT。
+主要约束是路由表容量、Pod CIDR 规划、跨可用区路径和 Pod IP 不属于 VPC 子网。
 ```
 
-**优点**：简单，无 VPC IP 消耗
-**缺点**：Pod 无法直接访问 VPC 内其他资源（需 NAT 网关），不支持固定 Pod IP
-
-#### 2.2 VPC-CNI（ENI 网络）**推荐**
-
-```
-Pod 直接从 VPC 子网获取弹性网卡 IP
-适用于：需要 Pod 与 VPC 内 CVM/数据库直通、固定 IP、超过 200 节点
+```text
+创建集群时需规划 Pod CIDR 与 Service CIDR；参数名称和限制以当前 TKE API/控制台为准。
 ```
 
-```yaml
-# VPC-CNI 模式下 Pod 直接使用 VPC IP
-# Pod 内看到的 IP = VPC 内可达的 IP
-# 无需 NAT 转换，性能更高
+#### 2.2 VPC-CNI（ENI 网络）
+
+```text
+Pod 直接获得 VPC 子网地址，便于与 VPC 原生路由、安全组和固定 IP 能力集成；
+代价是消耗子网地址，并受 ENI/IP 配额与节点实例规格限制。
 ```
 
 | 对比维度 | Global Router | VPC-CNI |
 |----------|:---:|:---:|
-| Pod 网络性能 | 中（NAT 转发） | 高（ENI 直通） |
-| Pod 与 VPC 资源互通 | 需 NAT 网关 | 直接互通 |
-| 固定 Pod IP | ❌ | ✅ |
-| 子网 IP 消耗 | 低 | 高（需预留足够 IP） |
-| 节点 Pod 密度 | 高（256+） | 受 ENI 数量限制 |
+| 数据路径 | 独立 Pod CIDR + 路由 | VPC 子网地址 / ENI |
+| Pod 与 VPC 资源互通 | 路由与安全组允许时可直通 | 原生 VPC 地址互通 |
+| 固定 Pod IP | 依平台能力 | 通常更易支持 |
+| 地址与配额 | 关注路由表和 Pod CIDR | 关注子网 IP、ENI/IP 配额 |
+| 性能 | 需按实际路径压测 | 需按实际路径压测 |
 
-> **生产选型**：RAG 和 Panda 项目均使用 VPC-CNI，以确保游戏服 Pod 与 DB/Redis 低延迟直连。
+> **生产选型**：根据路由规模、IP 配额、安全组、固定 IP、跨可用区路径和压测结果选择，不按固定节点数或“中/高性能”结论决定。
 
 #### 2.3 VPC-CNI 固定 IP 示例
 
@@ -7029,13 +6923,14 @@ metadata:
 ```
 
 ```
-传统模式:  CLB → NodePort → kube-proxy → Pod（2 跳）
-直通模式:  CLB → Pod ENI（1 跳，延迟降低 40%）
+传统模式:  CLB → NodePort/Service 数据路径 → Pod
+直通模式:  CLB → Pod ENI
+实际时延和吞吐收益取决于 CLB、CNI、跨可用区、转发模式与连接规模，必须压测验证
 ```
 
 ### 4 BCS 游戏工作负载
 
-蓝鲸容器服务 BCS 在 TKE 之上扩展了游戏专用的 CRD，Panda 和 RAG 项目均重度使用：
+以下为特定平台/项目中的游戏工作负载 CRD 示例，字段、控制器行为和 API 版本不是 Kubernetes 通用标准；二次学习时必须以目标集群实际安装的 CRD 与控制器源码为准：
 
 #### 4.1 GameStatefulSet（游戏有状态集）
 
@@ -7076,9 +6971,9 @@ spec:
 
 | 能力 | StatefulSet | GameStatefulSet |
 |------|:---:|:---:|
-| 原地升级 | ❌ | ✅（只换镜像，不重建 Pod，保留 IP） |
-| 缩容前置检查 | ❌ | ✅（HookTemplate 确保玩家下线） |
-| 金丝雀更新 | ❌ | ✅（分区发布） |
+| 原地升级 | ❌（原生 RollingUpdate 会替换 Pod） | 取决于扩展 Controller 能力；需验证容器重启、IP 与连接行为 |
+| 缩容前置检查 | ❌（可结合业务 Controller/Admission 扩展） | 可通过 HookTemplate 等扩展实现，但不能覆盖节点故障和强删 |
+| 金丝雀更新 | ✅（可用 RollingUpdate `partition` 做序号分区） | 可提供更细粒度策略，取决于具体 Controller |
 | 滚动更新顺序 | 序号顺序 | 序号顺序 + 自定义 |
 
 #### 4.2 HookTemplate（缩容前置检查）
@@ -7093,13 +6988,15 @@ metadata:
 spec:
   metrics:
     - name: online_players        # 在线玩家数
-      url: http://localhost:9090/metrics
+      # 这是特定 Controller 的伪配置，字段必须以目标 CRD schema 为准；
+      # 查询 Prometheus 应使用 /api/v1/query，而不是 /metrics。
+      url: http://prometheus-operated.monitoring.svc:9090/api/v1/query
       params:
         query: game_online_players{pod="${POD_NAME}"}
       threshold: 0                # 阈值：玩家数 = 0 才允许缩容
       operator: eq
     - name: pending_requests      # 正在处理的请求数
-      url: http://localhost:9090/metrics
+      url: http://prometheus-operated.monitoring.svc:9090/api/v1/query
       params:
         query: game_pending_requests{pod="${POD_NAME}"}
       threshold: 0
@@ -7108,7 +7005,7 @@ spec:
   onTimeout: ForceDelete          # 超时后强制删除或取消操作（Cancel）
 ```
 
-> **原理**：kubelet 缩容时先调用 HookTemplate，轮询 Prometheus 直到阈值满足或超时。游戏服在有玩家在线时绝不会被删除。
+> **原理边界**：这属于特定 Workload Controller/Webhook 的扩展流程，不是 kubelet 原生缩容能力。控制器可在删除前检查指标并等待，但超时策略、控制器故障、直接删除和节点故障仍可能导致 Pod 被删除，不能承诺“绝不会”。
 
 #### 4.3 SidecarSet（全局 Sidecar 注入）
 
@@ -7275,25 +7172,12 @@ url = client.get_presigned_url(
 
 CA 监听 Pending 的 Pod，自动扩容节点池；空闲节点缩容：
 
-```yaml
-# 为节点池启用 CA
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: cluster-autoscaler-status
-  namespace: kube-system
-data:
-  status: |
-    cluster-autoscaler:
-      nodeGroups:
-        - name: ap-guangzhou-3
-          minSize: 3
-          maxSize: 50
-          # 空闲节点缩容阈值（默认 10 分钟）
-          scaleDownUnneededTime: 10m
-          # 缩容前允许的空闲时间
-          scaleDownUnreadyTime: 20m
+```shell
+# cluster-autoscaler-status 是 Cluster Autoscaler 维护的状态输出，不是配置入口；不要手工 apply/覆盖。
+$ kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml
 ```
+
+TKE 节点池的 `min/max`、缩容策略通常通过 TKE 控制台/API 配置；自建 Cluster Autoscaler 则通过 Deployment 参数、节点组自动发现与云提供商配置完成。
 
 **HPA + CA 协同工作**：
 

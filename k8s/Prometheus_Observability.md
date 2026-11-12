@@ -18,15 +18,15 @@
 | **Sample** | 样本点 | 时间序列中的一个数据点，由 `(timestamp, value)` 组成 |
 | **Cardinality** | 基数 | 时间序列的总数量。高基数（如用 user_id 做标签）会导致性能问题 |
 | **Exposition Format** | 暴露格式 | Prometheus 定义的纯文本指标格式，`/metrics` 端点返回的内容，人类可读、逐行解析 |
-| **Scrape** | 采集/抓取 | Prometheus 通过 HTTP GET 拉取 `/metrics` 端点的行为。默认 15s~60s 一次 |
+| **Scrape** | 采集/抓取 | Prometheus 通过 HTTP GET 拉取 `/metrics` 端点的行为。上游默认 `scrape_interval` 通常为 1m，实际部署可按场景覆盖 |
 | **Target** | 采集目标 | 被 Prometheus 采集的端点。K8s 中一个 Pod 的 `/metrics` 端点就是一个 Target |
 | **Service Discovery (SD)** | 服务发现 | 自动发现 Target 的机制。K8s SD 通过 API Server 发现 Pod/Service/Endpoint |
-| **TSDB** | Time Series Database | Prometheus 自研时序数据库，由 WAL + Head Block + Disk Block 三层组成 |
-| **WAL** | Write-Ahead Log | 预写日志。每个 scrape 的数据先写 WAL（磁盘）再写内存，保证崩溃不丢数据 |
+| **TSDB** | Time Series Database | Prometheus 时序数据库，由 WAL、当前可变 Head 与不可变 Disk Block 组成 |
+| **WAL** | Write-Ahead Log | 记录 Head 中尚未形成磁盘 Block 的数据，用于进程崩溃后的重放；不能覆盖磁盘/WAL 损坏等故障 |
 | **Recording Rule** | 记录规则 | 预计算并存储聚合结果的规则，加速 Grafana 查询、降低 PromQL 计算量 |
-| **Alerting Rule** | 告警规则 | 定义触发告警条件的规则，Prometheus 定时评估并将触发的告警推送给 AlertManager |
-| **AlertManager** | 告警管理器 | 独立的告警处理服务，负责去重、分组、抑制、静默、路由告警到通知渠道 |
-| **remote_write** | 远程写入 | Prometheus 将采集的指标实时转发到外部存储（Thanos/VictoriaMetrics）的协议 |
+| **Alerting Rule** | 告警规则 | 定义触发告警条件的规则，Prometheus 定时评估并将触发的告警推送给 Alertmanager |
+| **Alertmanager** | 告警管理器 | 独立的告警处理服务，负责去重、分组、抑制、静默、路由告警到通知渠道 |
+| **remote_write** | 远程写入 | 将样本发送给 Thanos Receive、Mimir/Cortex、VictoriaMetrics 等远端接收端的协议；Thanos Sidecar 模式不使用它上传 Block |
 | **relabel** | 标签重写 | 在采集前/存储前对 Target 标签进行增删改的机制。控制"采集谁"和"叫什么名" |
 | **metric_relabel** | 指标标签重写 | 在存储前对已采集的指标标签进行增删改的机制。控制"存什么"和"丢弃什么" |
 
@@ -51,8 +51,8 @@
 │  输出示例：                                                                │
 │  # HELP http_requests_total Total HTTP requests                          │
 │  # TYPE http_requests_total counter                                      │
-│  http_requests_total{method="GET",status="200"} 152347 1715678900         │
-│  http_requests_total{method="POST",status="201"} 89231 1715678900         │
+│  http_requests_total{method="GET",status="200"} 152347 1715678900000         │
+│  http_requests_total{method="POST",status="201"} 89231 1715678900000         │
 │                                                                          │
 │  关键点：每个数据行 = 指标名 + {标签} + 值 + 时间戳（可选）                  │
 └──────────────────────────────────┬───────────────────────────────────────┘
@@ -65,8 +65,9 @@
 │  (kubernetes_sd_configs)          (List & Watch)                         │
 │                                                                          │
 │  K8s SD 自动发现链路：                                                      │
-│  ServiceMonitor.selector → Service.labels → Service.selector → Pod       │
-│  → 提取 Pod IP + Port → 生成 Target                                       │
+│  ServiceMonitor.spec.selector → Service.labels → EndpointSlice            │
+│  → 从 EndpointSlice 地址与端口生成 Target                                  │
+│  普通 selector-backed Service 的 EndpointSlice 通常由 Pod 状态维护           │
 │                                                                          │
 │  对每个 Target 应用 relabel_configs：                                       │
 │    原始标签：__meta_kubernetes_pod_ip, __meta_kubernetes_pod_name...       │
@@ -79,36 +80,36 @@
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  Phase 3: 数据采集（Scrape 生命周期 — 由 Retrieval 模块执行）                │
 │                                                                          │
-│  每 scrape_interval 秒（默认 15s），Retrieval 模块对每个 Target：           │
+│  每 scrape_interval 秒（上游默认通常为 1m），Retrieval 模块对每个 Target：   │
 │                                                                          │
 │  Step 1: Retrieval ──HTTP GET──▶ http://<pod-ip>:9090/metrics            │
 │  Step 2: 解析 text 格式，逐行转换为 (metric_name, labels, value, timestamp) │
-│  Step 3: 附加 scrape 时间戳（Prometheus 的时间，不是应用的时间）              │
-│  Step 4: 写入 WAL（磁盘，崩溃恢复用）                                       │
-│  Step 5: 写入 Head Block（内存，最近 2h 热数据）                             │
-│  Step 6: 评估 Recording Rules 和 Alerting Rules                           │
+│  Step 3: 样本未提供时间戳时使用抓取时间；显式时间戳由 honor_timestamps 控制    │
+│  Step 4: 追加写入 WAL，并将样本加入 Head                                   │
+│  Step 5: Head 数据周期性切块并持久化为 Disk Block                           │
 │                                                                          │
-│  时序保证：                                                                 │
-│  - 每次 scrape 的时间戳 = Prometheus Server 发起请求的时间                   │
-│  - 如果 scrape 失败 → 标记 Target 为 DOWN，不覆盖旧数据                      │
-│  - 连续 2 次 scrape 间隔超过 5 分钟 → 数据出现空洞（Staleness）              │
-│  - WAL 保证进程崩溃不丢数据（重启后从 WAL 恢复）                              │
+│  时序与失效语义：                                                           │
+│  - scrape 失败会将 Target 标记为 DOWN，并在当前抓取中写入 up=0               │
+│  - 目标持续存在但抓取失败，与目标从服务发现中消失的 stale marker 时机不同       │
+│  - 无 stale marker 时，查询引擎使用约 5m lookback 作为兜底                    │
+│  - Rules 由 evaluation_interval 或 rule group interval 独立调度             │
+│  - WAL 用于崩溃恢复，但仍需关注磁盘损坏、保留窗口和远程写积压边界                │
 └──────────────────────────────────┬───────────────────────────────────────┘
                                    │
                                    ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  Phase 4: 数据存储（TSDB 三层架构）                                         │
 │                                                                          │
-│  ┌──────────┐    ┌──────────────┐    ┌──────────────────┐                │
-│  │   WAL    │───▶│  Head Block  │───▶│  Disk Block      │                │
-│  │ 磁盘预写  │    │  内存（2h）   │    │  磁盘（2h 块）     │                │
-│  │ append   │    │  随机读写     │    │  顺序读写          │                │
-│  └──────────┘    └──────────────┘    └──────────────────┘                │
+│  ┌──────────┐    ┌────────────────────┐    ┌──────────────────┐          │
+│  │   WAL    │───▶│ Head（当前可变数据区）│───▶│ Disk Block      │          │
+│  │ 磁盘日志  │    │ 活跃结构在内存；部分 │    │ 不可变磁盘块      │          │
+│  │ 崩溃重放  │    │ chunks_head 可 mmap │    │                  │          │
+│  └──────────┘    └────────────────────┘    └──────────────────┘          │
 │                                                                          │
-│  压缩策略：                                                                │
-│  2h Block → Compaction → 6h Block → Compaction → 24h Block               │
+│  压缩策略：Head 通常按约 2h 生成初始 Block，Compactor 再合并相邻 Block；       │
+│  合并层级和最大时间范围由实现与 retention 决定，不是固定 2h→6h→24h            │
 │  目的：减少文件数 + 降低查询时需要扫描的块数量                                │
-│  超出 retention（默认 15 天）的块 → 直接删除                                │
+│  超出配置的 retention time/size 后删除旧块；上游常见默认时间为 15d，但 Chart 可覆盖 │
 └──────────────────────────────────┬───────────────────────────────────────┘
                                    │
                                    ▼
@@ -147,8 +148,8 @@
 六步走完一条线：
 ① 代码打点暴露 /metrics
 ② K8s SD 自动发现 Target
-③ Retrieval 模块 HTTP 拉取 → 解析 → 写 WAL → 写内存
-④ 2h 后从内存压缩到磁盘块
+③ Retrieval 模块 HTTP 拉取 → 解析 → 通过 TSDB appender 写入 Head 并记录 WAL
+④ Head 按时间窗口切成不可变磁盘 Block，后续由 Compactor 合并
 ⑤ PromQL 查询（HTTP Server）→ Grafana 可视化
 ⑥ Alerting 模块评估规则 → AlertManager → 通知渠道
 ```
@@ -219,7 +220,7 @@
 │  │        │             │          │             │                 │   │
 │  │        ▼             ▼          ▼             ▼ 告警            │   │
 │  │  ┌──────────────────────────────────────────┐                 │   │
-│  │  │  WAL → Head Block(内存2h) → Disk Block    │                 │   │
+│  │  │  WAL + Head（可变数据区）→ 不可变 Disk Block │                 │   │
 │  │  └──────────────────────────────────────────┘                 │   │
 │  │                                                              │   │
 │  │  ┌──────────────┐  ┌─────────────────┐                       │   │
@@ -253,8 +254,8 @@
 |------|--------|----------|----------|
 | **Service Discovery** | 外部依赖 | 自动发现监控目标 | `kubernetes_sd_configs` 调 API Server |
 | **Retrieval**（拉取模块） | Prometheus 内部 | 主动 HTTP GET 拉取 `/metrics` | scrape 池 + 协程并发 |
-| **TSDB** | Prometheus 内部 | 存储样本点 | WAL + Head Block + Disk Block 三层 |
-| **Rules**（规则引擎） | Prometheus 内部 | 评估 Recording/Alerting Rule | 定期评估（每 scrape_interval） |
+| **TSDB** | Prometheus 内部 | 存储样本点 | WAL + 当前可变 Head + 不可变 Disk Block |
+| **Rules**（规则引擎） | Prometheus 内部 | 评估 Recording/Alerting Rule | 按全局 `evaluation_interval` 或 Rule Group 的 `interval` 独立调度 |
 | **Alerting**（告警生成） | Prometheus 内部 | 将触发的告警推给 Alertmanager | 状态机：Pending → Firing |
 | **HTTP Server** | Prometheus 内部 | 对外暴露 PromQL + Web UI | `/api/v1/query`, `/api/v1/query_range` |
 | **Remote Read/Write** | Prometheus 内部 | 与外部存储交互 | 把数据推出去（Write）/ 拉过来（Read） |
@@ -304,19 +305,18 @@ Retrieval 是 Prometheus 最核心的模块之一，负责所有的数据采集�
 ┌─────────────────────────────────────────────┐
 │              TSDB (Time Series Database)     │
 │                                             │
-│  ┌────────┐    ┌──────────┐   ┌──────────┐  │
-│  │  WAL   │───▶│  Head    │──▶│  Disk    │  │
-│  │  磁盘   │    │  Block   │   │  Block   │  │
-│  │ 预写日志 │    │  内存    │   │  磁盘    │  │
-│  │ append │    │ (2h 热)  │   │ (2h 块)  │  │
-│  └────────┘    └──────────┘   └──────────┘  │
-│       ↑             ↑              ↑         │
-│    崩溃恢复      实时查询      压缩 + 删除    │
-│                                             │
-│  /data/                                     │
-│  ├── wal/           ← 崩溃恢复               │
-│  ├── chunks_head/   ← 最近 2h 原始数据        │
-│  └── 01HXXXX/       ← 压缩后的 2h 块文件      │
+│  ┌────────┐    ┌──────────────┐   ┌──────────┐  │
+│  │  WAL   │───▶│    Head      │──▶│  Disk    │  │
+│  │ 磁盘日志│    │ 当前可变数据区 │   │  Block   │  │
+│  │ 崩溃重放│    │ 活跃结构在内存 │   │ 不可变    │  │
+│  └────────┘    └──────────────┘   └──────────┘  │
+│       ↑               ↑               ↑         │
+│    崩溃恢复        实时查询       持久化/压缩/删除 │
+│                                                │
+│  /data/                                        │
+│  ├── wal/           ← 崩溃重放日志               │
+│  ├── chunks_head/   ← Head 中已持久化并可 mmap 的 chunk │
+│  └── 01HXXXX/       ← 不可变 Block 目录           │
 └─────────────────────────────────────────────┘
 ```
 
@@ -355,21 +355,23 @@ HTTP Server 是 Prometheus 对外的统一接口：
 Remote Read: Prometheus 主动从外部存储拉数据（用于查询时合并）
 Remote Write: Prometheus 主动把数据推到外部存储（用于长期保存）
 
-典型场景：Prometheus 本地只保留 15 天，远程存储保留 1 年+
+典型场景：Prometheus 本地保留较短时间窗口，远程存储承担更长保留期与全局查询；保留时长应按容量、查询范围和运维成本确定，不固定为 15 天。
 
 Remote Write 流程：
-  Prometheus 采集 → Append 到 TSDB → 同时通过 Remote Write 协议
-  → 推送到 Thanos Receive / Cortex / VictoriaMetrics
+  Prometheus 采集 → Append 到本地 TSDB / WAL
+  → Remote Write 队列从 WAL 读取样本并分片、批量发送
+  → 推送到 Thanos Receive / Cortex / Mimir / VictoriaMetrics
 
 Remote Read 流程：
-  Grafana 发起 PromQL → Prometheus 查本地 TSDB（命中最近数据）
-  → 如果查询时间范围在本地之外 → 通过 Remote Read 从远程存储拉
-  → 合并返回给 Grafana
+  Grafana 发起 PromQL → Prometheus 按配置把部分查询交给远端读取
+  → 本地与远端结果由查询引擎合并
+  注意：不是所有长期存储方案都依赖 Prometheus Remote Read；Thanos 通常由 Thanos Query 聚合 Sidecar / Store Gateway。
 
-性能开销：
-  - Remote Write 默认打开后，CPU 增加 5-10%
-  - queue_config 调优可以显著影响吞吐量
-  - 推不下去会阻塞本地 TSDB（监控：prometheus_remote_storage_*）
+性能与故障边界：
+  - 开销取决于 samples/s、标签量、批大小、压缩、分片和远端延迟，不能套固定百分比
+  - 远端不可用时队列会退避重试并产生积压，通常不会同步阻塞本地抓取和 TSDB 写入
+  - 若故障超过 WAL 可追赶窗口或磁盘容量边界，尚未发送的远端数据可能丢失
+  - 重点监控 prometheus_remote_storage_* 队列、失败、重试和最高发送时间戳指标
 ```
 
 ### 3 数据写入路径
@@ -386,21 +388,21 @@ Remote Read 流程：
   relabel 引擎处理标签
        │
        ▼
-  WAL append (先写磁盘)
+  TSDB appender：样本加入 Head，并记录 WAL
        │
        ▼
-  Head Block in-memory (再写内存)
+  Head 达到时间窗口后切为不可变 Disk Block
        │
-       ▼ (2h 后)
-  Disk Block (压缩到磁盘)
+       ▼
+  Compactor 合并相邻 Block，Retention 清理旧块
 
 写入性能关键:
-  ┌──────────────────────────────────────────────────┐
-  │ WAL 在 SSD 上（随机写，需要高 IOPS）              │
-  │ Head Block 在内存中（样本存储，约 3KB/sample）   │
-  │ Compaction 合并 2h 块为更大的块（降低查询开销）    │
-  │ Retention 删除过期块（默认 15 天）                │
-  └──────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────┐
+  │ WAL 以顺序追加为主；磁盘延迟、吞吐、容量和 fsync 稳定性都重要 │
+  │ Head 内存主要受活跃 series、标签、chunk 和索引开销影响         │
+  │ 不能使用固定“每 sample 若干 KB”估算内存，应以实测指标容量规划   │
+  │ Compaction 合并块以减少查询扫描开销；Retention 由时间/大小配置   │
+  └────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -445,14 +447,15 @@ spec:
       release: prometheus
   podMonitorNamespaceSelector: {}
   
-  # === 采集目标标签（附加到所有 Target） ===
+  # === 额外 scrape_configs（引用 Secret 中的配置片段） ===
+  # 它不会自动给所有 Target 加标签；目标标签应在对应抓取配置的 relabelings 中设置。
   additionalScrapeConfigs:
     name: additional-scrape-configs
     key: scrape-configs.yaml
   
   # === 远程写入（长期存储） ===
   remoteWrite:
-    - url: http://thanos-receive.monitoring:19291/api/v1/write
+    - url: http://thanos-receive.monitoring.svc.cluster.local:19291/api/v1/receive
       queueConfig:
         capacity: 2500                  # 内存队列容量
         maxShards: 200                  # 最大并发分片
@@ -506,14 +509,18 @@ spec:
     runAsUser: 1000
   
   # === TSDB 调优 ===
-  tsdb:
-    outOfOrderTimeWindow: 10m           # 允许乱序数据的时间窗（仅 2.39+）
+  # 默认不要开启乱序窗口；仅在确认确有乱序写入需求，并用当前 Prometheus Operator CRD
+  # 校验 outOfOrderTimeWindow 字段后配置。
   
   # === 查询 ===
-  query:
-    lookbackDelta: 5m                   # 查询时回看时间
-    maxSamples: 50000000                # 单次查询最大样本数
-    timeout: 2m
+  # 这些是 Prometheus CLI 参数，不是嵌套 query 字段；应用前用当前 Operator CRD 校验 additionalArgs。
+  additionalArgs:
+    - name: query.lookback-delta
+      value: 5m
+    - name: query.max-samples
+      value: "50000000"
+    - name: query.timeout
+      value: 2m
   
   # === 亲和性（HA 实例分散到不同节点） ===
   affinity:
@@ -546,24 +553,24 @@ spec:
 ### 3 WAL 与崩溃恢复
 
 ```
-WAL (Write-Ahead Log) 保证数据不丢失:
+WAL (Write-Ahead Log) 的目标是降低进程崩溃后的数据丢失窗口：
 
-scrape → WAL append (先写磁盘)
-           ↓
-       head block append (再写内存)
+scrape → 通过 TSDB appender 将样本加入 Head，并记录 WAL
 
 崩溃恢复:
-  Prometheus 重启 → 读取 WAL → 重放到 head block
-  耗时 ≈ WAL 大小 / 磁盘速度（通常 1~5 分钟）
+  Prometheus 重启 → 读取 WAL → 重放到 Head
+  恢复时间取决于 WAL 大小、磁盘吞吐、CPU、活跃序列与损坏情况，不套固定分钟数
 
-WAL 大小控制:
-  --storage.tsdb.wal-compression    # 压缩 WAL，节省 70% IO
-  --storage.tsdb.wal-segment-size   # 段大小，默认 128MB
+WAL 相关配置:
+  --storage.tsdb.wal-compression    # 开启压缩以减少 WAL 空间，实际收益依数据而定
+  --storage.tsdb.wal-segment-size   # 段大小；默认值和支持范围以当前版本 --help 为准
+
+边界：WAL 不能替代备份/副本，也不能保证磁盘损坏、超出保留窗口或未成功持久化的数据绝不丢失。
 ```
 
 ---
 
-## 第二章 Prometheus 四种核心指标类型（面试必问）
+## 第三章 Prometheus 四种核心指标类型（面试必问）
 
 > 面试官大概率会问："Prometheus 有哪四种指标类型？分别用在什么场景？"
 > 四种类型不仅是 API 分类，更决定了**存储方式、查询函数、性能特性**。
@@ -605,8 +612,8 @@ Counter 的查询陷阱：
   
   为什么必须用 rate/increase？
   → Counter 是累积值，今天 1 万明天 2 万，直接看没意义
-  → rate() = (最新值 - 区间开始值) / 区间秒数，得到平均每秒增长
-  → rate 能自动处理 Counter Reset（重启归零的断点）
+  → rate() 使用范围向量内的样本估算平均每秒增长率，处理可见 Counter Reset，并对查询边界外推
+  → 不能简化为固定首尾两点相减；抓取间隔内不可见的多次 Reset 仍可能导致低估
 ```
 
 ### 2 Gauge — 可增可减的瞬时仪表
@@ -699,9 +706,9 @@ http_request_duration_seconds_count 3500
 格式规则（面试要记住）：
 1. # HELP <name> <描述>     — 指标文档（可省略）
 2. # TYPE <name> <类型>     — 指标类型声明（可省略）
-3. <name>{<labels>} <value> [<timestamp>]  — 数据行
+3. <name>{<labels>} <value> [<timestamp_ms>] — 数据行；显式时间戳为 Unix 毫秒
 4. labels 为空时可以写 <name> <value>（如 process_cpu_seconds_total）
-5. 时间戳可选（Prometheus 采集时会用自己采集时刻的时间戳覆盖）
+5. 时间戳可选；未提供时使用抓取时间。显式时间戳默认由 `honor_timestamps: true` 保留，设为 `false` 时才改用抓取时间
 6. 不支持嵌套 JSON，是一行一行的 KV 对
 
 为什么用纯文本而不 JSON？
@@ -734,7 +741,7 @@ PushGateway 的坑：
 
 ---
 
-## 第三章 ServiceMonitor 原理深入（面试场景版）
+## 第四章 ServiceMonitor 原理深入（面试场景版）
 
 > `K8s_Advanced.md` 第二十八章已覆盖 ServiceMonitor 的完整字段和 5 个生产案例，
 > 此处补充**内部工作流程**和**终极调试方法**。
@@ -815,20 +822,19 @@ spec:
       scrapeTimeout: 10s           # ⑤ 采集超时
 ```
 
-> **三步串联逻辑**：ServiceMonitor.selector → Service.labels → Service.selector → Pod.labels → Pod IP:port/metrics
+> **三步串联逻辑**：`ServiceMonitor.spec.selector` 匹配 Service 标签；Operator 生成基于 EndpointSlice/Endpoints 的发现配置，再从其地址与端口生成 Target。普通 selector-backed Service 的 EndpointSlice 通常由 Controller 根据 Pod 标签与就绪状态维护；selectorless Service 也可以绑定手工 EndpointSlice。
 >
 > **为什么不用 Pod 注解？** 两种发现方式的本质区别：
 > ```
-> 注解方式（老派，原生 Prometheus）：
->   Prometheus SD → 扫描所有 Pod 的 annotation → 找 scrape="true" → 提取 port/path
->   缺点：配置散落在 Pod 里，改起来到处改
+> 注解约定方式（需在原生 Prometheus 配置中自行编写 relabel 规则）：
+>   Prometheus SD → 发现 Pod → 按 annotation 过滤并提取端口/路径
+>   缺点：规则和注解约定容易分散
 >
-> ServiceMonitor（新派，Operator）：
->   ServiceMonitor.selector → Service.labels → Service.selector → Pod
->   优点：配置集中在 ServiceMonitor CRD，改一处即可
+> ServiceMonitor（Operator）：
+>   ServiceMonitor → Service → EndpointSlice/Endpoints → Target
+>   优点：抓取配置集中为 CR，且由 Operator 生成 Prometheus 配置
 >
->   Pod 只需要有正确的 label，不需要任何 annotation。
->   上面 Step 1 的 Deployment 里没有 annotation，就是对的。
+>   普通 Service 场景下 Pod 只需被 Service selector 选中，不要求 scrape annotation。
 > ```
 
 **Step 4：验证采集**
@@ -843,8 +849,10 @@ game-server-monitor    2m
 $ kubectl port-forward -n monitoring svc/prometheus-operated 9090:9090
 # 打开 http://localhost:9090/targets → 搜索 game-server → 状态应为 UP
 
-# 查询指标
-$ curl -s 'http://localhost:9090/api/v1/query?query=up{job="game-prod/game-server-monitor"}' | jq
+# 查询指标：不要把生成配置中的 scrape job 名误当成 job 标签
+$ curl -sG 'http://localhost:9090/api/v1/query' \
+    --data-urlencode 'query=up{namespace="game-prod",service="game-server-metrics"}' | jq
+# 若需要固定 job 标签，应设置 ServiceMonitor.spec.jobLabel，并在 Service 上提供对应标签
 ```
 
 ### 1 从 ServiceMonitor 到 Scrape 的完整链路
@@ -854,21 +862,20 @@ $ curl -s 'http://localhost:9090/api/v1/query?query=up{job="game-prod/game-serve
   │
   ▼
 时刻 T+1s: Prometheus Operator watch 到 ServiceMonitor 创建
-  │  operator 解析 ServiceMonitor → 生成 Prometheus 配置片段
-  │  operator 调用 Prometheus API: POST /-/reload
+  │  Operator 解析 ServiceMonitor 并生成 Prometheus 配置
+  │  config-reloader sidecar 检测配置变化并触发 Prometheus reload
   │
   ▼
-时刻 T+2s: Prometheus 重载配置 → Service Discovery 开始工作
-  │  K8s SD 查询 API Server: GET /api/v1/services
-  │  匹配 ServiceMonitor.selector → 找到对应的 Service
-  │  通过 Service.selector → 找到对应的 Pod
-  │  提取 Pod IP + targetPort → 生成 Target 列表
-  │  应用 relabelings → 生成最终的 Target Labels
+Prometheus 重载配置 → Service Discovery 开始工作
+  │  K8s SD 通过 API Server 发现 Service / EndpointSlice / Pod 元数据
+  │  匹配 ServiceMonitor.selector → 找到对应 Service
+  │  按 Service 端口名和发现元数据生成候选 Target
+  │  应用 target relabelings → 生成最终 Target Labels
   │
   ▼
-时刻 T+5s: Scraper 开始首次采集 GET http://<pod-ip>:<port>/metrics
-  │  scrape 成功 → 数据写入 WAL + head block
-  │  scrape 失败 → 标记 Target 为 DOWN, 1s 后重试
+Scraper 按 interval 采集 GET http://<target>:<port>/metrics
+  │  scrape 成功 → 样本写入 TSDB，up=1
+  │  scrape 失败 → 当前轮 up=0，通常等待下一个 scrape 周期，不固定 1s 重试
   │
   ▼
 持续: 每 interval 秒重复上述 scrape 过程
@@ -927,7 +934,7 @@ $ curl -s http://localhost:9090/api/v1/targets | \
 
 ---
 
-## 第四章 PrometheusRule & 告警规则进阶
+## 第五章 PrometheusRule & 告警规则进阶
 
 > `K8s_Advanced.md` 第十九章有基本告警规则，此处补充**Recording Rules、模板化、分组抑制**。
 
@@ -955,8 +962,9 @@ spec:
         # 命名空间级别 CPU 使用率
         - record: namespace:container_cpu_usage:sum
           expr: |
-            sum(rate(container_cpu_usage_seconds_total{container!=""}[5m]))
-            by (namespace)
+            sum by (namespace) (
+              rate(container_cpu_usage_seconds_total{container!="", image!=""}[5m])
+            )
         
         # 99 分位延迟（预计算 histogram）
         - record: job:http_request_duration_seconds:p99
@@ -998,7 +1006,7 @@ cluster:node_cpu_utilization:avg     # 集群级别，节点 CPU 使用率，平
       服务: {{ $labels.service }}
       命名空间: {{ $labels.namespace }}
       当前错误率: {{ $value | humanizePercentage }}
-      时间段: {{- range query "timestamp(increase(http_requests_total[1m]))" }}
+      评估窗口: 5m
       Runbook: https://wiki.internal/runbooks/{{ $labels.service }}-error-rate
     # 自定义标签用于 Alertmanager 路由
     dashboard_url: "https://grafana.internal/d/gamesvr-errors?var-namespace={{ $labels.namespace }}"
@@ -1019,9 +1027,13 @@ spec:
   # 抑制规则：高层告警触发时抑制低层告警
   inhibitRules:
     - sourceMatch:
-        - severity: critical
+        - name: severity
+          value: critical
+          matchType: "="
       targetMatch:
-        - severity: warning
+        - name: severity
+          value: warning
+          matchType: "="
       equal: ['namespace']
       # 含义：同 namespace 的 critical 告警会抑制 warning 告警
   
@@ -1035,16 +1047,22 @@ spec:
     
     # 按 severity 分叉
     routes:
-      - match:
-          severity: critical
+      - matchers:
+          - name: severity
+            value: critical
+            matchType: "="
         receiver: critical-webhook
         continue: true                       # 继续匹配下一个规则
-      - match:
-          severity: warning
-        receiver: warning-webhook
-      - match:
-          team: game-backend
-        receiver: game-team-webhook
+      - matchers:
+          - name: severity
+            value: warning
+            matchType: "="
+        receiver: default-webhook
+      - matchers:
+          - name: team
+            value: game-backend
+            matchType: "="
+        receiver: default-webhook
   
   # 接收器定义
   receivers:
@@ -1067,7 +1085,7 @@ spec:
 
 ---
 
-## 第五章 Grafana 仪表盘即代码
+## 第六章 Grafana 仪表盘即代码
 
 ### 1 通过 ConfigMap 预置仪表盘
 
@@ -1079,9 +1097,9 @@ metadata:
   namespace: monitoring
   labels:
     grafana_dashboard: "1"           # Grafana sidecar 自动识别
-spec:
-  data:
-    gamesvr-dashboard.json: |
+
+data:
+  gamesvr-dashboard.json: |
       {
         "title": "GameServer Overview",
         "tags": ["gamesvr", "production"],
@@ -1160,33 +1178,31 @@ $__from / $__to   # 时间范围的 Unix 时间戳
 
 ---
 
-## 第六章 高可用与长期存储
+## 第七章 高可用与长期存储
 
 ### 1 Prometheus HA 模式
 
 ```
-┌─────────────────────────────────────────┐
-│         Prometheus HA（无状态）          │
-│                                         │
-│   ┌──────────────┐  ┌──────────────┐    │
-│   │ Prometheus-0 │  │ Prometheus-1 │    │
-│   │ (独立采集)    │  │ (独立采集)    │    │
-│   │ /data/...    │  │ /data/...    │    │
-│   └──────┬───────┘  └──────┬───────┘    │
-│          │                 │            │
-│          └────────┬────────┘            │
-│                   ▼                     │
-│          ┌──────────────────┐          │
-│          │   Grafana (任意   │          │
-│          │   选一个源查询)    │          │
-│          └──────────────────┘          │
-│                                         │
-│   数据不共享，但都独立采集到全量数据       │
-│   单实例故障不影响其他实例                 │
-└─────────────────────────────────────────┘
+┌───────────────────────────────────────────────┐
+│          Prometheus HA（有状态双副本）          │
+│                                               │
+│   ┌──────────────┐  ┌──────────────┐          │
+│   │ Prometheus-0 │  │ Prometheus-1 │          │
+│   │ 独立 TSDB/PVC │  │ 独立 TSDB/PVC │          │
+│   │ 独立采集全量  │  │ 独立采集全量  │          │
+│   └──────┬───────┘  └──────┬───────┘          │
+│          └────────┬────────┘                  │
+│                   ▼                           │
+│       LB / Thanos Query / 其他统一查询层        │
+│                   │                           │
+│                   ▼                           │
+│                Grafana                        │
+│                                               │
+│   两副本不复制本地数据，采样值和时间戳可能略有差异 │
+└───────────────────────────────────────────────┘
 ```
 
-Prometheus Operator 配置 HA 只需设置 `replicas: 2` 和 `podAntiAffinity`（见第二章 CR 配置）。
+设置 `replicas: 2` 和反亲和只解决采集副本冗余；完整 HA 还需持久化存储、统一查询/故障切换、告警去重及副本标签去重设计。Grafana 不会自动随机切换两个数据源。
 
 ### 2 Thanos 长期存储架构
 
@@ -1242,14 +1258,15 @@ spec:
       name: thanos-objstore-config
     # Sidecar 自动将本地块上传到对象存储
     
-  # 外部标签（Thanos 去重依据）
+  # 外部标签（集群标签；副本标签由 Operator/Thanos 集成机制按版本配置）
   externalLabels:
     cluster: prod-gz
-    replica: $(POD_NAME)
+  # 不要假设普通 YAML 中的 $(POD_NAME) 会按 shell 语义自动展开。
+  # 请使用当前 Prometheus Operator 支持的 replica external label 配置，并核对 CRD。
   
   # 远程写入备选（如果不用 Sidecar）
   # remoteWrite:
-  #   - url: http://thanos-receive.monitoring:19291/api/v1/write
+  #   - url: http://thanos-receive.monitoring.svc.cluster.local:19291/api/v1/receive
 ```
 
 ### 3 Remote Write 到 VictoriaMetrics
@@ -1269,7 +1286,7 @@ spec:
 
 ---
 
-## 第七章 Prometheus 性能调优速查
+## 第八章 Prometheus 性能调优速查
 
 ### 1 常见性能瓶颈与解决
 
@@ -1279,7 +1296,7 @@ spec:
 | Scrape 超时 | Target 响应慢 | 增加 `scrapeTimeout`，减少 `/metrics` 大小 |
 | WAL 损坏 | 磁盘故障或 OOM | SSD + `--storage.tsdb.wal-compression` |
 | Compaction 慢 | 数据量大 | 增加 CPU，使用 SSD |
-| 启动慢 | WAL 重放 | 定期 compact WAL，控制 retention |
+| 启动慢 | WAL 重放量大或磁盘慢 | 使用低延迟持久盘、控制活跃序列和写入量、保证优雅退出并监控 WAL checkpoint/truncation；不要手工 compact 或删除 WAL |
 | 查询慢 | 未用 Recording Rules | 常用查询预聚合为 Recording Rules |
 
 ### 2 大规模集群优化清单
@@ -1311,13 +1328,15 @@ sum(up{job!=""}) by (job) / count(up{job!=""}) by (job) < 0.99
 prometheus_tsdb_head_chunks
 process_resident_memory_bytes
 
-# 查询延迟分位数
-histogram_quantile(0.99, rate(prometheus_engine_query_duration_seconds_bucket[5m]))
+# 查询阶段耗时：该指标通常为 Summary，直接使用其 quantile 序列；先在 /metrics 核对当前版本
+max by (slice) (
+  prometheus_engine_query_duration_seconds{quantile="0.99"}
+)
 ```
 
 ---
 
-## 第八章 生产完整部署流程
+## 第九章 生产完整部署流程
 
 ### 1 部署步骤总览
 
@@ -1337,7 +1356,9 @@ Step 10: 压测 + 调优
 ### 2 完整 Helm 安装命令
 
 ```shell
-helm install monitoring prometheus-community/kube-prometheus-stack \
+# 先由 External Secrets/Sealed Secrets 等创建 monitoring/grafana-admin-credentials，
+# 其中包含 admin-user 与 admin-password 两个 key；不要把明文密码写进命令行。
+helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
     --namespace monitoring \
     --create-namespace \
     --set prometheus.prometheusSpec.retention=15d \
@@ -1349,7 +1370,9 @@ helm install monitoring prometheus-community/kube-prometheus-stack \
     --set prometheus.prometheusSpec.podMonitorSelector.matchLabels.release=prometheus \
     --set alertmanager.alertmanagerSpec.storage.volumeClaimTemplate.spec.storageClassName=cbs-premium \
     --set alertmanager.alertmanagerSpec.storage.volumeClaimTemplate.spec.resources.requests.storage=10Gi \
-    --set grafana.adminPassword=<GRAFANA_PASSWORD> \
+    --set grafana.admin.existingSecret=grafana-admin-credentials \
+    --set grafana.admin.userKey=admin-user \
+    --set grafana.admin.passwordKey=admin-password \
     --set grafana.persistence.enabled=true \
     --set grafana.persistence.size=10Gi \
     --set grafana.sidecar.dashboards.enabled=true \
@@ -1386,7 +1409,7 @@ $ kubectl port-forward -n monitoring svc/monitoring-grafana 3000:80
 
 ---
 
-## 第九章 服务网格可观测性（Istio + Prometheus）
+## 第十章 服务网格可观测性（Istio + Prometheus）
 
 > Istio 内置 Prometheus 指标导出，通过 Prometheus Operator 的 ServiceMonitor 声明式采集，
 > 实现服务网格级别的全链路可观测性（流量指标、延迟分布、错误率）。
@@ -1416,9 +1439,9 @@ sum(rate(istio_requests_total{
 sum(rate(istio_requests_total{reporter="source"}[5m])) by (destination_service_name)
 * 100
 
-# P99 延迟（reporter=server 以服务端为准）
+# P99 延迟（reporter=destination，使用前核对实际 Istio 指标标签）
 histogram_quantile(0.99,
-  sum(rate(istio_request_duration_milliseconds_bucket{reporter="server"}[5m]))
+  sum(rate(istio_request_duration_milliseconds_bucket{reporter="destination"}[5m]))
   by (destination_service_name, le)
 )
 
@@ -1430,8 +1453,9 @@ topk(10,
 ```
 
 **reporter 标签说明**：
-- `reporter="server"` — 由 **destination Sidecar** 上报（更准确，不会被 client 端重试影响）
-- `reporter="source"` — 由 **source Sidecar** 上报（包含完整的 source 标签信息）
+- `reporter="destination"` / 某些版本中的目标侧语义 — 由目标侧代理观察到的请求尝试，适合目标侧流量与延迟 SLI；客户端重试仍可能形成多次目标侧请求
+- `reporter="source"` — 由源侧代理观察，通常包含更完整的 source 标签
+- 标签名和值随 Istio 指标版本演进，使用前应检查实际 `/stats/prometheus` 输出
 
 ### 2 ServiceMonitor 采集 Istio 指标
 
@@ -1478,12 +1502,11 @@ spec:
     - port: http-envoy-prom
       interval: 15s
       path: /stats/prometheus
-      relabelings:
-        # 只保留 istio_ 前缀的指标（减少指标量）
+      metricRelabelings:
+        # __name__ 只在样本阶段可用，因此必须放在 metricRelabelings
         - action: keep
           sourceLabels: [__name__]
           regex: 'istio_.*'
-      metricRelabelings:
         # 丢弃高基数的标签
         - action: labeldrop
           regex: 'connection_security_policy|response_flags|grpc_response_status'
@@ -1524,19 +1547,19 @@ $ kubectl label configmap istio-dashboards -n monitoring grafana_dashboard=1
   "panels": [
     {
       "title": "Request Rate",
-      "expr": "sum(rate(istio_requests_total{reporter='server'}[5m])) by (destination_service_name)"
+      "expr": "sum(rate(istio_requests_total{reporter='destination'}[5m])) by (destination_service_name)"
     },
     {
       "title": "Error Rate %",
-      "expr": "sum(rate(istio_requests_total{reporter='server',response_code=~'5..'}[5m])) by (destination_service_name) / sum(rate(istio_requests_total{reporter='server'}[5m])) by (destination_service_name) * 100"
+      "expr": "sum(rate(istio_requests_total{reporter='destination',response_code=~'5..'}[5m])) by (destination_service_name) / sum(rate(istio_requests_total{reporter='destination'}[5m])) by (destination_service_name) * 100"
     },
     {
       "title": "P99 Latency",
-      "expr": "histogram_quantile(0.99, sum(rate(istio_request_duration_milliseconds_bucket{reporter='server'}[5m])) by (destination_service_name, le))"
+      "expr": "histogram_quantile(0.99, sum(rate(istio_request_duration_milliseconds_bucket{reporter='destination'}[5m])) by (destination_service_name, le))"
     },
     {
       "title": "Traffic Composition",
-      "expr": "sum(rate(istio_requests_total{reporter='server'}[5m])) by (destination_service_name, source_workload)"
+      "expr": "sum(rate(istio_requests_total{reporter='destination'}[5m])) by (destination_service_name, source_workload)"
     }
   ]
 }
@@ -1544,7 +1567,7 @@ $ kubectl label configmap istio-dashboards -n monitoring grafana_dashboard=1
 
 ### 4 分布式追踪集成（Istio + Jaeger/Tempo）
 
-Istio 自动传播 [W3C TraceContext](https://www.w3.org/TR/trace-context/) 和 B3 格式的追踪头：
+Istio/Envoy 支持读取 W3C TraceContext、B3 等追踪头并生成代理 Span，但应用必须把入站追踪上下文传播到后续出站请求，或使用具备自动传播能力的探针；否则跨服务 Trace 会断链：
 
 ```
 Pod A ── x-request-id: abc123 ──▶ Pod B ── x-request-id: abc123 ──▶ Pod C
@@ -1599,9 +1622,9 @@ spec:
       rules:
         - alert: IstioHigh5xxErrorRate
           expr: |
-            sum(rate(istio_requests_total{reporter="server",response_code=~"5.."}[5m])) by (destination_service_name)
+            sum(rate(istio_requests_total{reporter="destination",response_code=~"5.."}[5m])) by (destination_service_name)
             /
-            sum(rate(istio_requests_total{reporter="server"}[5m])) by (destination_service_name) > 0.05
+            sum(rate(istio_requests_total{reporter="destination"}[5m])) by (destination_service_name) > 0.05
           for: 5m
           labels:
             severity: critical
@@ -1613,7 +1636,7 @@ spec:
         - alert: IstioHighP99Latency
           expr: |
             histogram_quantile(0.99,
-              sum(rate(istio_request_duration_milliseconds_bucket{reporter="server"}[5m]))
+              sum(rate(istio_request_duration_milliseconds_bucket{reporter="destination"}[5m]))
               by (destination_service_name, le)
             ) > 1000
           for: 5m
@@ -1633,7 +1656,7 @@ spec:
             summary: "Istio Pilot 内存 > 3GB"
 
         - alert: IstioSidecarInjectionFailure
-          expr: rate(pilot_injection_failure_total[5m]) > 0
+          expr: rate(sidecar_injection_failure_total[5m]) > 0
           for: 1m
           labels:
             severity: critical
@@ -1646,12 +1669,12 @@ spec:
 
 ```
 □ Metadata Exchange / TCP 日志 → 用 Telemetry API 控制（不用 MeshConfig）
-□ reporter 优先选 "server" 端（更准确的延迟）
+□ 服务端视角通常使用 reporter="destination"；使用前检查实际 istio_requests_total 标签值，避免跨版本假设
 □ 高基数标签仅保留必要项（response_code / destination_service_name）
 □ 使用 metricRelabelings 丢弃不需要的指标前缀
 □ 采样率平衡：生产 1%~10%，灰度 50%，排障 100%
 □ 控制平面监控：istio_* 指标 + Pilot 日志 + xDS 推送延迟
-□ 使用 Istio Operator 而非 istioctl install 管理 Istio 版本
+□ 使用 Helm、`istioctl install -f`、revision/canary 或 GitOps 管理 Istio；不再采用已弃用的集群内 Istio Operator 路线
 □ Recording Rules 预聚合 istio_requests_total 的 rate()
 ```
 
@@ -1684,7 +1707,7 @@ spec:
 
 ---
 
-## 第十章 PromQL 实战速查
+## 第十一章 PromQL 实战速查
 
 > PromQL 是 Prometheus 的查询语言。本节从实际运维场景出发，覆盖最常用的查询模式。
 
@@ -1693,10 +1716,10 @@ spec:
 | 类型 | 说明 | 示例 |
 |------|------|------|
 | **Instant Vector** | 某一时刻的所有时间序列值 | `http_requests_total` |
-| **Range Vector** | 一段时间范围内的值 | `http_requests_total[5m]` |
-| **Scalar** | 单个数值 | `count(up == 1)` |
+| **Range Vector** | 每条时间序列在一段时间内的样本集合 | `http_requests_total[5m]` |
+| **Scalar** | 单个数值 | `scalar(count(up == 1))` |
 
-> Instant Vector 可以画表格，Range Vector 可以画曲线。大多数函数（`rate`、`increase` 等）只接受 Range Vector。
+> Instant Vector 可作为即时查询结果，也可在范围查询中按每个 step 评估后绘图；Range Vector 通常作为 `rate()`、`increase()`、`*_over_time()` 等函数的输入，不能直接作为普通面板的最终表达式。
 
 ### 2 最常用的四个函数
 
@@ -1706,9 +1729,9 @@ spec:
 # 过去 5 分钟内，每秒 HTTP 请求数的平均增长率
 rate(http_requests_total[5m])
 
-# 注意：[5m] 不是"取最后 5 分钟的数据"
-# 而是"取最后一个数据点向前 5 分钟范围内的所有数据点，计算每秒增长率"
-# 4 个 scrape_interval 是推荐最小值（如 scrape_interval=30s，则 [5m]=10 个采样点）
+# 在每个 PromQL 评估时刻，metric[5m] 选择该时刻之前 5 分钟内的样本
+# 范围由查询评估时间锚定，而不是由最后一个样本锚定
+# rate 窗口通常至少覆盖约 4 个 scrape_interval，并为抓取抖动留余量；Grafana 可使用 $__rate_interval
 ```
 
 **increase() — 计算区间增长总量（Counter 专用）**
@@ -1752,18 +1775,26 @@ histogram_quantile(0.99,
 **CPU 使用率**
 ```promql
 # 容器 CPU 使用率（相对 request 的百分比）
-sum(rate(container_cpu_usage_seconds_total{container!=""}[5m])) by (pod)
-  /
-sum(kube_pod_container_resource_requests{resource="cpu"}) by (pod)
+sum by (namespace, pod) (
+  rate(container_cpu_usage_seconds_total{container!="", image!=""}[5m])
+)
+/
+sum by (namespace, pod) (
+  kube_pod_container_resource_requests{resource="cpu", unit="core"}
+)
   * 100
 ```
 
 **内存使用率**
 ```promql
 # Pod 内存相对于 limit 的使用比例
-sum(container_memory_usage_bytes{container!=""}) by (pod)
-  /
-sum(kube_pod_container_resource_limits{resource="memory"}) by (pod)
+sum by (namespace, pod) (
+  container_memory_working_set_bytes{container!="", image!=""}
+)
+/
+sum by (namespace, pod) (
+  kube_pod_container_resource_limits{resource="memory", unit="byte"} > 0
+)
 ```
 
 **Pod 重启次数**
@@ -1801,7 +1832,7 @@ sum(rate(http_requests_total[5m])) by (service)
 
 | 操作 | 作用 | 示例 |
 |------|------|------|
-| `sum by (label)` | 按标签求和 | `sum(rate(...)[5m])) by (pod)` |
+| `sum by (label)` | 按标签求和 | `sum by (pod) (rate(http_requests_total[5m]))` |
 | `avg by (label)` | 按标签求平均 | `avg(node_cpu_seconds_total) by (instance)` |
 | `topk(N, expr)` | 取前 N 个最大值 | `topk(5, rate(http_requests_total[5m]))` |
 | `bottomk(N, expr)` | 取前 N 个最小值 | `bottomk(5, node_memory_available)` |
@@ -1812,20 +1843,19 @@ sum(rate(http_requests_total[5m])) by (service)
 ### 6 向量匹配（多指标联合查询）
 
 ```promql
-# 方式 A：一对一匹配（默认忽略不匹配的标签）
-rate(http_requests_total[5m])
-  /
-ignoring(status)                   # 忽略 status 标签的差异
-rate(http_requests_total[5m])
-
-# 方式 B：多对一匹配（group_left / group_right）
-# 场景：Pod CPU 使用量 / Pod CPU request
-sum(rate(container_cpu_usage_seconds_total[5m])) by (namespace, pod)
-  /
-on(namespace, pod)                 # 按这两个标签 join
-group_left                         # 左侧是多行，右侧是单行
-kube_pod_container_resource_requests{resource="cpu"}
+# 默认二元向量运算要求匹配标签集一致；on/ignoring 用于显式控制匹配键。
+# 场景：按 Pod 聚合的 CPU 使用量 / 按 Pod 聚合的 CPU request（一对一）
+sum by (namespace, pod) (
+  rate(container_cpu_usage_seconds_total{container!=""}[5m])
+)
+/
+on(namespace, pod)
+sum by (namespace, pod) (
+  kube_pod_container_resource_requests{resource="cpu", unit="core"}
+)
 ```
+
+> 只有当一侧确实存在额外多条序列、另一侧的匹配键唯一时，才按正确方向使用 `group_left` 或 `group_right`；否则会产生 many-to-many 错误。
 
 ### 7 时间偏移
 
@@ -1855,7 +1885,7 @@ rate(http_requests_total[5m] offset 1d)
 
 ---
 
-## 第十一章 Prometheus 面试高频 15 问
+## 第十二章 Prometheus 面试高频 15 问
 
 > 以下问题整合了真实 Prometheus 面试中反复出现的技术考察点，
 > 按数据流顺序（暴露→采集→存储→查询→告警→调优）编排。
@@ -1870,13 +1900,13 @@ rate(http_requests_total[5m] offset 1d)
 4. Prometheus Server 通过 Service Discovery 发现该 Pod
 5. 按 scrape_interval（如 30s）发起 HTTP GET /metrics
 6. 解析文本格式 → 生成 (metric, labels, value, timestamp) 样本
-7. 样本先 append 到 WAL（磁盘），再 append 到 Head Block（内存）
-8. 2h 后 Head Block 压缩为 Disk Block
-9. Grafana 通过 PromQL 查询 Prometheus API
-10. Prometheus 从 TSDB（内存+磁盘块）中检索数据并返回
+7. 样本经 TSDB appender 加入 Head，并写入 WAL 以支持崩溃恢复
+8. Head 按时间窗口切块并持久化为 Disk Block（通常约 2h，受实现与配置影响）
+9. Grafana 通过 Prometheus HTTP API 发起 PromQL 查询
+10. Prometheus 从 Head 与磁盘块中检索数据并返回
 11. Grafana 渲染图表
 
-面试加分项：提到 WAL 保证数据不丢、stale marker 机制、retention 策略
+面试加分项：说明 WAL 的恢复作用与边界、stale marker 的不同触发场景、retention 与 compaction
 ```
 
 ### Q2：Counter 重启归零后，rate() 为什么不会出现负数尖刺？
@@ -1885,17 +1915,17 @@ rate(http_requests_total[5m] offset 1d)
 Counter 重启后值归零 → 下一个 scrape 的值从 0 开始
 rate() 检测到"当前值 < 上一个 scrape 值" → 判定为 Counter Reset
 Counter Reset 处理逻辑：
-  rate = (上一个 scrape 值 + 当前 scrape 值) / 时间间隔
-  // 把重置前的值"加回来"，避免负数
+  rate()/increase() 看到值下降时会按 reset 处理，不把下降量当成负增长；
+  它根据范围向量内的样本重建可观测增量，并对区间边界做外推。
   
 实际例子：
   t1 时刻 scrape 到 1000
   进程重启
   t2 时刻 scrape 到 10
-  → rate = (1000 + 10) / 30s = 33.67/s  ✅
+  → 两个观测点之间能确认的新增长主要是重启后的 10，而不是 1010
+  → 具体 rate 还受查询窗口、样本数和边界外推影响，不能简化为固定两点公式
   
-注意：increase() 也有同样的 reset 处理
-如果两次 scrape 之间重启了 2 次 → rate() 无法处理（会低估）
+注意：increase() 本质上是区间 rate 的语法糖式结果；若两次 scrape 之间发生多次重启，未被观测到的增长无法恢复，会低估。可用 resets(counter[窗口]) 验证可见 reset 次数。
 ```
 
 ### Q3：histogram_quantile() 和 Summary 的 quantile 有什么区别？
@@ -1918,20 +1948,23 @@ Summary quantile（客户端计算）：
   → "Summary 只在无法接受 Histogram 近似误差时使用（罕见）"
 ```
 
-### Q4：为什么 Prometheus 不适合存储超过 15 天的数据？
+### Q4：Prometheus 本地 TSDB 应该保留多久？
 
 ```
-Prometheus TSDB 的设计目标：存储最近数据，快速查询。
+Prometheus 本地 TSDB 没有“超过 15 天就不适合”的硬限制，retention 可按时间和大小配置。
 
-15 天后数据被删除的原因：
-1. 本地磁盘有限：每个 sample 原始约 3 bytes，1000 万 series 每天约 100GB+
-2. Compaction 压力：超过 15d 的块太多，compaction 会变得很慢
-3. 查询性能：扫描过多磁盘块会导致查询超时
+选型依据：
+1. 活跃 series、samples/s、抓取间隔和标签基数
+2. 本地磁盘容量、WAL/Compaction 开销和故障恢复时间
+3. 查询跨度、并发与延迟 SLO
+4. 是否需要跨集群全局视图、对象存储和长期归档
 
-解决方案：
-  → 短期（<15d）：Prometheus 本地 TSDB（热数据，查询快）
-  → 长期（>15d）：Thanos / VictoriaMetrics 对象存储（冷数据，降采样后查询）
-  → remote_write 将数据实时发送到长期存储，本地只保留热数据
+常见方案：
+  → 本地 TSDB 保留满足日常排障的热数据窗口
+  → Thanos / Mimir / VictoriaMetrics 等承担跨集群或长期查询
+  → Remote Write 或 Thanos Sidecar 的链路与故障边界需分别设计
+
+结论：保留期是容量与运维决策，不是固定 15 天；必须根据实测指标和查询需求计算。
 ```
 
 ### Q5：ServiceMonitor 创建后，Target 没有出现在 Prometheus UI 中，排查思路？
@@ -1982,44 +2015,43 @@ Prometheus TSDB 的设计目标：存储最近数据，快速查询。
          regex: 'user_id|trace_id|session_id'
   ③ 监控基数趋势：
      prometheus_tsdb_head_series  ← 当前活跃的序列数
-  ④ 超过 1000 万条序列 → 考虑分片 Prometheus
+  ④ 根据 active series、samples/s、内存、WAL、查询并发与 SLO 联合决定是否分片，不使用固定序列数阈值
 ```
 
 ### Q7：Recording Rule 和 Alerting Rule 的执行有什么区别？
 
 ```
 执行频率：
-  - Recording Rule: interval 字段控制（如 60s）
-  - Alerting Rule: 与 scrape 同步（每 scrape 完一轮就评估）
+  - 两类规则都由全局 evaluation_interval 或 Rule Group 的 interval 调度
+  - 规则评估与 scrape 独立，不保证每轮 scrape 完成后立即执行
   
-执行顺序：Recording Rule → Alerting Rule
+执行顺序：
+  - 同一 Rule Group 内按文件中的顺序顺序评估，可让后续规则引用前面刚生成的结果
+  - 不同 Rule Group 可能并行评估，不能依赖跨组顺序
   
 Recording Rule 存储的是预计算结果：
   - 存储为新的时间序列（如 job:http_requests_total:rate5m）
-  - Grafana 查询时直接用预计算结果，不需实时聚合
+  - Grafana 或告警可复用结果，减少重复计算
   
-Alerting Rule 产生告警状态：
-  - 不存储结果，只输出到 AlertManager
-  - 有三种状态：Inactive → Pending(满足 expr 但未满 for) → Firing(满足 expr 且满 for)
-
-为什么先执行 Recording Rule？
-  → Alerting Rule 可能引用 Recording Rule 的结果
-  → 避免重复计算
+Alerting Rule 维护告警状态：
+  - 计算结果本身不会像 Recording Rule 一样保存为新业务时间序列
+  - 状态为 Inactive → Pending（满足 expr 但未满 for）→ Firing
 ```
 
 ### Q8：Prometheus HA 方案中，两个实例的数据一定一致吗？
 
 ```
-不一致！Prometheus HA 是"无状态主主"而非"有状态主备"
+不一致！Prometheus HA 通常是“两个有状态实例独立采集”，而不是数据复制型主备。
 
 两个 Prometheus 实例：
-  - 各自独立采集（不是数据复制）
-  - 采集时机不完全同步（scrape 时间有毫秒偏差）
-  - 数据可能有微小差异（scrape 时间不同 → 时间戳不同 → 值不同）
+  - 各自维护本地 TSDB/PVC，并独立采集相同 Target
+  - 采集时机不完全同步（scrape 时间有偏差）
+  - 数据可能有微小差异（时间戳和值都可能不同）
 
 查询时：
-  - Grafana 随机选一个实例查询
-  - 两个实例的数据在统计意义上近似（但不会完全一致）
+  - Grafana 只会查询配置的数据源，不会自动随机选择或故障切换
+  - 普通负载均衡可提高查询入口可用性，但不会合并或去重两个副本的数据
+  - Thanos Query 等查询层在正确配置 replica label 后，才可聚合并执行副本去重
   
 为什么会不一致？
   t0: Prometheus-0 scrape GET /metrics → 返回 counter=1000
@@ -2070,12 +2102,11 @@ for 的作用：防止告警抖动（Alert Flapping）
 
 有 for: 5m：
   t0: expr 满足 → 进入 Pending（不告警）
-  t0+30s: expr 不满足 → 退出 Pending（不告警，无事发生）
-  t5: expr 持续满足 5 分钟 → Firing（告警！）
-  t5+30s: expr 不满足 → 保持 Firing（不会立即 Resolved）
-  → 必须连续 3 个 evaluation_interval 不满足 → 才 Resolved
+  t0+30s: expr 不满足 → 下一次评估退出 Pending
+  expr 连续满足约 5 分钟 → Firing（告警）
+  Firing 后下一次评估不再满足 → 默认退出 Firing 并发送 Resolved
 
-生产建议：for 至少设为 evaluation_interval × 3（约 1m~5m）
+如果希望短暂恢复时仍保持 Firing，应显式配置 keep_firing_for。for 应按故障容忍时间和 SLO 设计，不套固定“评估周期 × 3”公式。
 ```
 
 ### Q11：Prometheus 的 pull 模型在 K8s 网络隔离场景下有什么问题？
@@ -2105,20 +2136,19 @@ K8s NetworkPolicy 或 Calico/Cilium 网络策略可能导致：
 ```
 方法：设置 externalLabels
 
-Prometheus CR 配置：
+Prometheus CR 配置示意：
   externalLabels:
     cluster: prod-gz
-    prometheus: k8s    ← 或 prometheus_replica: $(POD_NAME)
+    prometheus: k8s
 
 作用：
-  → 所有从该实例采集的指标都会附加 cluster="prod-gz" 标签
-  → Thanos / Cortex 用 externalLabels 去重
-  → Grafana 中可以通过 cluster 标签区分数据来源
+  → 在联邦、Remote Write、告警和 Thanos 等外部通信场景标识数据来源
+  → Thanos 可结合 cluster 标签和专用 replica 标签进行副本去重
+  → 统一查询层可按 cluster 区分数据来源
 
 注意：
-  externalLabels 的应用时机是在 scrape 数据写入 TSDB 时
-  → 不会覆盖应用自身的标签
-  → 如果指标已有 cluster 标签 → externalLabels 不会覆盖（尊重原始标签）
+  externalLabels 不是 scrape 阶段写入本地 TSDB 的普通采集标签；本地直接查询时不要假设它一定存在。
+  外部标签不会覆盖同名原始标签。副本标签的注入方式应以当前 Prometheus Operator/Thanos 版本和 CRD 为准，不要假设 $(POD_NAME) 会自动展开。
 ```
 
 ### Q13：Prometheus 的 scrape_timeout 和 scrape_interval 应该怎么设置？
@@ -2127,9 +2157,9 @@ Prometheus CR 配置：
 scrape_interval：两次采集之间的间隔
 scrape_timeout：单次采集等待响应的超时时间
 
-规则：scrape_timeout < scrape_interval（必须！否则会堆积）
+约束：Prometheus 要求 `scrape_timeout <= scrape_interval`；生产通常设置为严格小于，以给调度、网络抖动和处理留出余量。同一 Target 的慢抓取不会简单无限并发堆积，但会造成超时、采样空洞和资源压力。
 
-典型配置：
+典型起点（必须结合目标响应时间与 SLO 调整）：
   ┌──────────────┬──────────────────┐
   │ 场景          │ interval / timeout│
   ├──────────────┼──────────────────┤
@@ -2144,7 +2174,7 @@ timeout 太小 → 频繁超时，Target 标记 DOWN
 timeout 太大 → 堆积 scrapes，影响整体采集节奏
 
 生产建议：
-  scrape_timeout = scrape_interval / 2 或 scrape_interval / 3
+  先测量 Exporter 响应时间和失败模式，再设置 timeout；应小于 interval 并留有余量，但不存在通用的 1/2 或 1/3 固定公式
 ```
 
 ### Q14：Grafana 图表中突然出现"断崖"现象，可能是什么原因？
@@ -2169,9 +2199,9 @@ timeout 太大 → 堆积 scrapes，影响整体采集节奏
 
 ```
 原因：
-1. Pull 模型的时间间隔导致数据丢失
-   → scrape_interval=30s 意味着可能丢失 30s 内的精确计数
-   → Counter 的 Inc() 次数在两次 scrape 之间的分布不可知
+1. Pull 模型无法记录区间内每个事件的精确发生时间
+   → 持续存在的 Counter 增量会累计到下一次成功抓取，不会仅因 scrape interval 而丢失
+   → 但进程在两次抓取之间重启、发生多次 Reset、目标短暂消失或抓取失败时，未观测增量可能丢失
 
 2. Counter Reset 处理不精确
    → 进程在两次 scrape 之间重启 2 次 → rate() 只能推算出一次 Reset
@@ -2181,9 +2211,9 @@ timeout 太大 → 堆积 scrapes，影响整体采集节奏
    → /metrics 暴露后，标签变更（如 Pod 重启后 IP 变了）
    → 前后数据无法关联
 
-4. Stale Marker
-   → 超过 5 分钟没有新数据 → 标记为 stale
-   → 查询时可能忽略这部分数据
+4. Staleness 与目标消失
+   → 抓取失败时会处理本轮消失的旧系列；目标从服务发现消失时会延迟写 stale marker
+   → 只有缺少 stale marker 时，即时查询才使用默认约 5 分钟 lookback 作为兜底
 
 替代方案（精确计费）：
   - 应用直接写数据库（每个事件一条记录）
@@ -2193,7 +2223,7 @@ timeout 太大 → 堆积 scrapes，影响整体采集节奏
 
 ---
 
-## 第十二章 数据采集深度解析（Scrape 生命周期）
+## 第十三章 数据采集深度解析（Scrape 生命周期）
 
 > 理解 Scrape 的内部机制是从"会用 Prometheus"到"精通 Prometheus"的分水岭。
 
@@ -2203,9 +2233,9 @@ timeout 太大 → 堆积 scrapes，影响整体采集节奏
 对于一个 Target 的单次 scrape 过程：
 
 Step 1: 连接建立
-  Prometheus → 从 SD 获取 Target 的 IP:Port
-  → 建立 HTTP 连接（默认 5s 连接超时）
-  → 发送 GET /metrics HTTP/1.1
+  Prometheus → 从 SD 获取 Target 的地址与抓取参数
+  → 在 scrape_timeout 约束内完成 DNS、连接、TLS、响应读取与解析
+  → 发送 GET /metrics（HTTP 版本与连接复用由客户端和目标共同决定）
 
 Step 2: 响应解析
   → 读取 HTTP Response Body（text/plain）
@@ -2214,42 +2244,40 @@ Step 2: 响应解析
   → 每解析完一个样本就交给 Append Queue
 
 Step 3: 时间戳处理
-  → 如果应用暴露了时间戳 → 对比当前时间，偏差超过阈值 → 丢弃
-  → 如果应用没有时间戳 → 使用 Prometheus 采集时刻的时间戳
-  → 新数据点的时间戳必须 > 上一个 scrape 的时间戳（否则标记乱序）
+  → honor_timestamps=true 时，Exporter 显式时间戳可被采用；未提供时使用抓取时间
+  → 过旧、过新或超出允许乱序窗口的样本可能被拒绝，具体受 TSDB 配置和版本影响
+  → 默认要求同一时间序列近似按时间递增；可配置有限 out-of-order window
 
 Step 4: 追加到存储
-  → append WAL（先写磁盘保证持久性）
-  → append Head Block（写入内存，计算新 chunk）
-  → 如果 Head Block 的 chunk 满了 → 创建新 chunk
-  → 旧 chunk 变为"不可变"，等待 2h 后 flush 到磁盘
+  → 样本经 appender 写入 Head，并追加到 WAL 用于崩溃恢复
+  → Head 中形成 chunk，随后切块并持久化为不可变 Block
+  → 不要把内部时序简化成每个样本严格“先落盘完成、再写内存”的同步事务
 
 Step 5: 健康检查
-  → scrape 成功 → Target 标记 UP（值为 1）
-  → scrape 失败 → Target 标记 DOWN（值为 0），1s 后重试一次
-  → 连续失败 → 保持 DOWN，不覆盖旧数据的 stale marker
+  → scrape 成功 → 当前轮 up=1
+  → scrape 失败 → 当前轮 up=0，通常等待下一个 scrape 周期
+  → 抓取失败和 Target 从服务发现消失会触发不同的 stale 处理路径
 
-Step 6: Rules 评估
-  → 这一轮 scrape 完成后 → 评估 Recording Rules
-  → Recording Rules 评估完后 → 评估 Alerting Rules
-  → 新触发的 alert → 推送到 AlertManager API
+Rules 独立调度：
+  → Rules 不属于单次 scrape 的固定 Step 6
+  → 由 evaluation_interval 或 Rule Group interval 触发
+  → 同一 Group 内顺序评估；跨 Group 不保证顺序
+  → Firing 告警由 Prometheus 发送给 Alertmanager
 ```
 
 ### 2 数据保鲜与 Stale Marker
 
 ```
-Stale Marker（过期标记）机制：
+Stale Marker（过期标记）机制需要区分三类场景：
 
-如果某个 Target 连续 5 分钟没有被成功 scrape：
-  → Prometheus 在该时间序列中插入一个 Stale Marker
-  → 查询时遇到 Stale Marker → 图表出现 gap（断线）
-  → 避免在不知道真实值的情况下保持旧值
+1. Target 仍在服务发现中，但本轮 scrape 失败：
+   → `up` 变为 0，并为本轮缺失的旧系列写入 stale marker，使即时查询不继续沿用旧值。
+2. Target 从服务发现中消失：
+   → Prometheus 会延迟写入 stale marker，以容忍短暂发现抖动；若 Prometheus 在此期间重启，该延迟标记可能无法写入。
+3. 没有 stale marker 可用：
+   → 即时查询使用约 5 分钟 lookback 作为兜底，超过窗口后不再返回旧样本。
 
-为什么需要 Stale Marker？
-  反例：没有 Stale Marker 时
-  → Target DOWN 后，PromQL 仍然能查到 5 分钟前的值
-  → rate() 计算会把 stale 数据也包含进去，导致指标虚低
-  → 告警可能延迟触发（因为 rate 被旧数据拉平了）
+作用：避免目标或某条系列消失后，查询长期沿用最后一个旧值。具体时机应通过“抓取失败、目标消失、Prometheus 重启”三组实验验证。
 ```
 
 ### 3 乱序数据处理
@@ -2270,15 +2298,16 @@ Stale Marker（过期标记）机制：
   超过窗口 → 丢弃并计数 prometheus_tsdb_out_of_order_samples_total
 
   生产建议：
-  - 开启乱序窗口但保持较小（5~10m）
-  - 监控 out_of_order 丢弃量 → 超过阈值说明时钟/网络有问题
+  - 默认保持乱序窗口关闭；只有 Remote Write Receiver、边缘补传等确有乱序需求时再启用
+  - 窗口越大会增加 Head 内存与查询复杂度，应按实际迟到分布选择
+  - 监控 out-of-order 接收/拒绝指标；异常可能来自显式时间戳、时钟、补传或链路问题
 ```
 
 ---
 
 
 > - `K8s_Advanced.md` 第十九章 — Prometheus + Grafana + Loki 部署
-> - `K8s_Advanced.md` 第二十七章 — CNI 内部原理 / Istio Operator 生产级安装
+> - `K8s_Advanced.md` 第二十七章 — CNI 内部原理 / Istio Helm、Revision 与 GitOps 安装
 > - `K8s_Advanced.md` 第二十八章 — ServiceMonitor / PodMonitor 全部字段与生产案例
 > - `K8s_Advanced.md` 第二十九章 §8 — 蓝鲸监控 (bkmonitor) 与 TKE 集成
 >
